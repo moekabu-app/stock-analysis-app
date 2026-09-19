@@ -1,0 +1,1949 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import os
+import requests
+from email.utils import parsedate_to_datetime
+
+
+# =========================================================
+# ページ設定
+# =========================================================
+st.set_page_config(
+    page_title="銘柄選定お助けマン",
+    page_icon="🔍",
+    layout="centered"
+)
+
+
+def get_secret_section(section_name):
+    """ローカルにsecrets.tomlがない場合でも安全に動かす。"""
+    try:
+        return st.secrets.get(section_name, {})
+    except Exception:
+        return {}
+
+
+def require_cloud_login():
+    """クラウド公開時だけGoogleログインとメール許可リストを有効にする。"""
+    app_settings = get_secret_section("app")
+    require_login = bool(app_settings.get("require_login", False))
+
+    # 自宅PCでの従来どおりの実行は、認証設定なしで利用できる。
+    if not require_login:
+        return
+
+    auth_settings = get_secret_section("auth")
+    required_auth_keys = (
+        "redirect_uri",
+        "cookie_secret",
+        "client_id",
+        "client_secret",
+        "server_metadata_url",
+    )
+
+    if not all(auth_settings.get(key) for key in required_auth_keys):
+        st.error("ログイン設定が不足しているため、アプリを開始できません。")
+        st.stop()
+
+    if not st.user.is_logged_in:
+        st.title("🔒 銘柄選定お助けマン")
+        st.write("このアプリは利用を許可された方専用です。")
+        if st.button("Googleでログイン"):
+            st.login()
+        st.stop()
+
+    user_email = str(st.user.get("email", "")).strip().lower()
+    allowed_emails = {
+        str(email).strip().lower()
+        for email in app_settings.get("allowed_emails", [])
+    }
+
+    if not user_email or user_email not in allowed_emails:
+        st.title("🔒 銘柄選定お助けマン")
+        st.error("このGoogleアカウントには利用許可がありません。")
+        if st.button("ログアウト"):
+            st.logout()
+        st.stop()
+
+    st.sidebar.caption(f"ログイン中：{st.user.get('name', user_email)}")
+    if st.sidebar.button("ログアウト"):
+        st.logout()
+
+
+require_cloud_login()
+
+
+# =========================================================
+# セッション状態
+# =========================================================
+if "helper_result" not in st.session_state:
+    st.session_state.helper_result = None
+
+if "helper_code" not in st.session_state:
+    st.session_state.helper_code = ""
+
+if "helper_company" not in st.session_state:
+    st.session_state.helper_company = ""
+
+if "helper_date" not in st.session_state:
+    st.session_state.helper_date = ""
+
+if "helper_styles" not in st.session_state:
+    st.session_state.helper_styles = []
+
+
+def reset_analysis():
+    st.session_state.helper_result = None
+    st.session_state.helper_code = ""
+    st.session_state.helper_company = ""
+    st.session_state.helper_date = ""
+    st.session_state.helper_styles = []
+    st.session_state.stock_code_input = ""
+
+
+# =========================================================
+# 共通処理
+# =========================================================
+def normalize_code(code):
+    code = str(code).strip()
+
+    if code.upper().endswith(".T"):
+        code = code[:-2]
+
+    return code
+
+
+def get_company_name(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        return (
+            info.get("shortName")
+            or info.get("longName")
+            or ticker
+        )
+    except Exception:
+        return ticker
+
+
+def download_stock_data(code):
+    ticker = f"{code}.T"
+
+    data = yf.download(
+        ticker,
+        period="1y",
+        interval="1d",
+        auto_adjust=False,
+        progress=False
+    )
+
+    if data is None or data.empty:
+        return None
+
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    required = ["Open", "High", "Low", "Close", "Volume"]
+
+    for col in required:
+        if col not in data.columns:
+            return None
+
+    data = data[required].copy()
+    data = data.dropna()
+
+    if len(data) < 80:
+        return None
+
+    return data
+
+
+def calculate_atr(data, period=14):
+    high = data["High"]
+    low = data["Low"]
+    close = data["Close"]
+
+    prev_close = close.shift(1)
+
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+
+    return tr.rolling(period).mean()
+
+
+# =========================================================
+# デイトレ簡易分析
+# =========================================================
+def analyze_daytrade(data):
+    df = data.copy()
+
+    df["MA5"] = df["Close"].rolling(5).mean()
+    df["MA25"] = df["Close"].rolling(25).mean()
+    df["ATR14"] = calculate_atr(df, 14)
+    df["Volume20"] = df["Volume"].rolling(20).mean()
+
+    df["Turnover"] = df["Close"] * df["Volume"]
+    df["Turnover20"] = df["Turnover"].rolling(20).mean()
+
+    df["High20"] = df["High"].rolling(20).max()
+    df["Low20"] = df["Low"].rolling(20).min()
+
+    latest = df.iloc[-1]
+
+    close = float(latest["Close"])
+    ma5 = float(latest["MA5"])
+    ma25 = float(latest["MA25"])
+    atr14 = float(latest["ATR14"])
+    volume = float(latest["Volume"])
+    volume20 = float(latest["Volume20"])
+    turnover20 = float(latest["Turnover20"])
+    high20 = float(latest["High20"])
+    low20 = float(latest["Low20"])
+
+    atr_pct = atr14 / close * 100 if close > 0 else 0
+    volume_ratio = volume / volume20 if volume20 > 0 else 0
+    ma_gap_pct = (ma5 / ma25 - 1) * 100 if ma25 > 0 else 0
+
+    if high20 > low20:
+        range_position = (close - low20) / (high20 - low20)
+    else:
+        range_position = 0.5
+
+    # 流動性 25点
+    turnover_oku = turnover20 / 100_000_000
+
+    if turnover_oku >= 100:
+        liquidity_score = 25
+        liquidity_label = "非常に高い"
+    elif turnover_oku >= 30:
+        liquidity_score = 22
+        liquidity_label = "高い"
+    elif turnover_oku >= 10:
+        liquidity_score = 18
+        liquidity_label = "十分"
+    elif turnover_oku >= 3:
+        liquidity_score = 12
+        liquidity_label = "やや少ない"
+    else:
+        liquidity_score = 5
+        liquidity_label = "少ない"
+
+    # 値幅 25点
+    if 3 <= atr_pct <= 7:
+        atr_score = 25
+    elif 2 <= atr_pct < 3:
+        atr_score = 21
+    elif 1.3 <= atr_pct < 2:
+        atr_score = 16
+    elif 7 < atr_pct <= 10:
+        atr_score = 18
+    elif atr_pct > 10:
+        atr_score = 10
+    else:
+        atr_score = 8
+
+    # 出来高活性 20点
+    if volume_ratio >= 2:
+        volume_score = 20
+    elif volume_ratio >= 1.4:
+        volume_score = 18
+    elif volume_ratio >= 1:
+        volume_score = 15
+    elif volume_ratio >= 0.7:
+        volume_score = 10
+    else:
+        volume_score = 5
+
+    # 短期トレンド明確さ 20点
+    abs_gap = abs(ma_gap_pct)
+
+    if abs_gap >= 4:
+        trend_score = 20
+    elif abs_gap >= 2:
+        trend_score = 17
+    elif abs_gap >= 0.8:
+        trend_score = 13
+    else:
+        trend_score = 8
+
+    if ma_gap_pct > 0.5:
+        trend_label = "上向き"
+    elif ma_gap_pct < -0.5:
+        trend_label = "下向き"
+    else:
+        trend_label = "横ばい"
+
+    # 価格位置 10点
+    if range_position >= 0.85:
+        position_score = 10
+        position_label = "20日高値圏"
+    elif range_position <= 0.15:
+        position_score = 10
+        position_label = "20日安値圏"
+    elif range_position >= 0.70:
+        position_score = 8
+        position_label = "高値寄り"
+    elif range_position <= 0.30:
+        position_score = 8
+        position_label = "安値寄り"
+    else:
+        position_score = 5
+        position_label = "中間圏"
+
+    total = (
+        liquidity_score
+        + atr_score
+        + volume_score
+        + trend_score
+        + position_score
+    )
+
+    if total >= 85:
+        grade = "A"
+        grade_text = "デイトレ候補としてかなり良好"
+    elif total >= 70:
+        grade = "B"
+        grade_text = "デイトレ候補として十分"
+    elif total >= 55:
+        grade = "C"
+        grade_text = "条件次第"
+    else:
+        grade = "D"
+        grade_text = "優先度低め"
+
+    comments = []
+
+    if turnover_oku >= 30:
+        comments.append("売買代金が大きく、流動性は十分あります。")
+    elif turnover_oku < 3:
+        comments.append("売買代金が少なく、注文の通りやすさには注意が必要です。")
+
+    if atr_pct >= 3:
+        comments.append("日中の値幅が出やすい銘柄です。")
+    elif atr_pct < 1.3:
+        comments.append("値幅は小さめで、デイトレでは動き不足になりやすいです。")
+
+    if volume_ratio >= 1.4:
+        comments.append("直近の出来高が活性化しています。")
+    elif volume_ratio < 0.7:
+        comments.append("直近の出来高はやや低調です。")
+
+    comments.append(f"短期トレンドは「{trend_label}」です。")
+    comments.append(f"現在位置は「{position_label}」です。")
+
+    return {
+        "score": int(total),
+        "grade": grade,
+        "grade_text": grade_text,
+        "close": close,
+        "turnover_oku": turnover_oku,
+        "atr_pct": atr_pct,
+        "volume_ratio": volume_ratio,
+        "trend": trend_label,
+        "ma_gap_pct": ma_gap_pct,
+        "position": position_label,
+        "comments": comments
+    }
+
+
+# =========================================================
+# スイング分析
+# =========================================================
+def analyze_swing(data):
+    df = data.copy()
+
+    df["MA5"] = df["Close"].rolling(5).mean()
+    df["MA25"] = df["Close"].rolling(25).mean()
+    df["MA75"] = df["Close"].rolling(75).mean()
+
+    df["ATR14"] = calculate_atr(df, 14)
+    df["Volume20"] = df["Volume"].rolling(20).mean()
+
+    df["High20"] = df["High"].rolling(20).max()
+    df["Low20"] = df["Low"].rolling(20).min()
+    df["High60"] = df["High"].rolling(60).max()
+    df["Low60"] = df["Low"].rolling(60).min()
+
+    latest = df.iloc[-1]
+
+    close = float(latest["Close"])
+    ma5 = float(latest["MA5"])
+    ma25 = float(latest["MA25"])
+    ma75 = float(latest["MA75"])
+    atr14 = float(latest["ATR14"])
+    volume = float(latest["Volume"])
+    volume20 = float(latest["Volume20"])
+
+    high20 = float(latest["High20"])
+    low20 = float(latest["Low20"])
+    high60 = float(latest["High60"])
+    low60 = float(latest["Low60"])
+
+    atr_pct = atr14 / close * 100 if close > 0 else 0
+    volume_ratio = volume / volume20 if volume20 > 0 else 0
+
+    return20 = (
+        close / float(df["Close"].iloc[-21]) - 1
+    ) * 100 if len(df) >= 21 else 0
+
+    return60 = (
+        close / float(df["Close"].iloc[-61]) - 1
+    ) * 100 if len(df) >= 61 else 0
+
+    # -----------------------------------------------------
+    # 1. トレンド 30点
+    # -----------------------------------------------------
+    trend_score = 0
+
+    if close > ma25:
+        trend_score += 8
+
+    if close > ma75:
+        trend_score += 7
+
+    if ma5 > ma25:
+        trend_score += 7
+
+    if ma25 > ma75:
+        trend_score += 8
+
+    if close > ma25 and ma25 > ma75:
+        trend_label = "上昇基調"
+    elif close < ma25 and ma25 < ma75:
+        trend_label = "下降基調"
+    elif close > ma75:
+        trend_label = "中期は底堅い"
+    else:
+        trend_label = "方向感が弱い"
+
+    # -----------------------------------------------------
+    # 2. 価格位置・支持抵抗 20点
+    # -----------------------------------------------------
+    if high60 > low60:
+        pos60 = (close - low60) / (high60 - low60)
+    else:
+        pos60 = 0.5
+
+    if 0.55 <= pos60 <= 0.85:
+        position_score = 20
+        position_label = "上昇余地を残した高値寄り"
+    elif 0.40 <= pos60 < 0.55:
+        position_score = 16
+        position_label = "60日レンジ中段"
+    elif 0.85 < pos60 <= 1.02:
+        position_score = 15
+        position_label = "60日高値圏"
+    elif 0.20 <= pos60 < 0.40:
+        position_score = 11
+        position_label = "やや安値寄り"
+    else:
+        position_score = 8
+        position_label = "60日レンジ端"
+
+    # -----------------------------------------------------
+    # 3. モメンタム 20点
+    # -----------------------------------------------------
+    momentum_score = 0
+
+    if 2 <= return20 <= 15:
+        momentum_score += 12
+    elif 0 < return20 < 2:
+        momentum_score += 8
+    elif 15 < return20 <= 25:
+        momentum_score += 8
+    elif return20 > 25:
+        momentum_score += 4
+    elif -5 <= return20 <= 0:
+        momentum_score += 5
+    else:
+        momentum_score += 2
+
+    if return60 > 0:
+        momentum_score += 8
+    elif return60 > -5:
+        momentum_score += 5
+    else:
+        momentum_score += 2
+
+    # -----------------------------------------------------
+    # 4. 出来高 15点
+    # -----------------------------------------------------
+    if 1.0 <= volume_ratio < 1.8:
+        volume_score = 15
+        volume_label = "適度に活発"
+    elif 1.8 <= volume_ratio <= 3.0:
+        volume_score = 13
+        volume_label = "かなり活発"
+    elif 0.7 <= volume_ratio < 1.0:
+        volume_score = 10
+        volume_label = "やや低め"
+    elif volume_ratio > 3.0:
+        volume_score = 9
+        volume_label = "急増・材料反応に注意"
+    else:
+        volume_score = 6
+        volume_label = "低調"
+
+    # -----------------------------------------------------
+    # 5. 値幅 15点
+    # -----------------------------------------------------
+    if 1.5 <= atr_pct <= 4.5:
+        volatility_score = 15
+        volatility_label = "スイング向き"
+    elif 1.0 <= atr_pct < 1.5:
+        volatility_score = 11
+        volatility_label = "やや穏やか"
+    elif 4.5 < atr_pct <= 7:
+        volatility_score = 10
+        volatility_label = "値幅大きめ"
+    elif atr_pct > 7:
+        volatility_score = 6
+        volatility_label = "値動きが荒い"
+    else:
+        volatility_score = 7
+        volatility_label = "値幅小さめ"
+
+    total = (
+        trend_score
+        + position_score
+        + momentum_score
+        + volume_score
+        + volatility_score
+    )
+
+    if total >= 82:
+        grade = "A"
+        grade_text = "スイング候補としてかなり良好"
+    elif total >= 68:
+        grade = "B"
+        grade_text = "スイング候補として十分"
+    elif total >= 52:
+        grade = "C"
+        grade_text = "条件を見ながら検討"
+    else:
+        grade = "D"
+        grade_text = "現時点では優先度低め"
+
+    # 支持・抵抗の簡易表示
+    resistance = high20
+    support = low20
+
+    comments = []
+
+    comments.append(f"5日・25日・75日線から見ると「{trend_label}」です。")
+
+    if return20 >= 10:
+        comments.append(
+            f"直近20営業日で +{return20:.1f}% と上昇が進んでおり、"
+            "追いかけ買いには注意が必要です。"
+        )
+    elif return20 >= 2:
+        comments.append(
+            f"直近20営業日は +{return20:.1f}% で、"
+            "適度な上向きモメンタムがあります。"
+        )
+    elif return20 <= -10:
+        comments.append(
+            f"直近20営業日は {return20:.1f}% と弱く、"
+            "反転確認が必要です。"
+        )
+
+    if volume_ratio >= 1.5:
+        comments.append("出来高が増えており、資金流入の有無を確認したい局面です。")
+    elif volume_ratio < 0.7:
+        comments.append("出来高は低調で、上昇・反発の持続力を確認したい局面です。")
+
+    if close >= high20 * 0.98:
+        comments.append("20日高値に近く、上抜けできるかが重要です。")
+    elif close <= low20 * 1.02:
+        comments.append("20日安値に近く、下げ止まりを確認したい位置です。")
+
+    return {
+        "score": int(total),
+        "grade": grade,
+        "grade_text": grade_text,
+        "close": close,
+        "trend": trend_label,
+        "position": position_label,
+        "return20": return20,
+        "return60": return60,
+        "volume_ratio": volume_ratio,
+        "volume_label": volume_label,
+        "atr_pct": atr_pct,
+        "volatility_label": volatility_label,
+        "ma5": ma5,
+        "ma25": ma25,
+        "ma75": ma75,
+        "support": support,
+        "resistance": resistance,
+        "high60": high60,
+        "low60": low60,
+        "data_date": pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d"),
+        "comments": comments
+    }
+
+
+# =========================================================
+# EDINET DB 決算データ
+# =========================================================
+EDINETDB_BASE_URL = "https://edinetdb.jp/v1"
+
+FORECAST_VALUE_KEYS = (
+    "forecast_revenue",
+    "forecast_operating_income",
+    "forecast_ordinary_income",
+    "forecast_net_income",
+    "forecast_eps",
+)
+
+
+def edinet_request_json(url, api_key, params=None):
+    try:
+        response = requests.get(
+            url,
+            headers={"X-API-Key": api_key},
+            params=params,
+            timeout=20
+        )
+
+        if response.status_code != 200:
+            return None, f"HTTP {response.status_code}"
+
+        return response.json(), None
+
+    except Exception as e:
+        return None, str(e)
+
+
+def extract_list_from_data(result):
+    if not isinstance(result, dict):
+        return []
+
+    data = result.get("data", [])
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        preferred_keys = [
+            "earnings",
+            "results",
+            "items",
+            "records",
+            "data",
+        ]
+
+        for key in preferred_keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+
+        for value in data.values():
+            if isinstance(value, list):
+                return value
+
+    return []
+
+
+def format_disclosure_date(value):
+    if not value:
+        return "不明"
+
+    text = str(value)
+
+    try:
+        dt = parsedate_to_datetime(text)
+        return dt.strftime("%Y/%m/%d")
+    except Exception:
+        pass
+
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10].replace("-", "/")
+
+    return text
+
+
+def format_financial_number(value):
+    if value is None:
+        return "不明"
+
+    try:
+        number = float(value)
+
+        if number.is_integer():
+            number = int(number)
+
+        return f"{number:,}"
+    except Exception:
+        return str(value)
+
+
+def calc_progress_rate(actual, forecast):
+    try:
+        actual = float(actual)
+        forecast = float(forecast)
+
+        if forecast == 0:
+            return None
+
+        return actual / forecast * 100
+
+    except Exception:
+        return None
+
+
+def forecast_target_fiscal_year_end(row):
+    fiscal_year_end = row.get("fiscal_year_end")
+
+    try:
+        fiscal_date = pd.Timestamp(fiscal_year_end)
+    except Exception:
+        return None
+
+    try:
+        quarter = int(row.get("quarter"))
+    except Exception:
+        quarter = None
+
+    note = str(row.get("forecast_period_note") or "")
+
+    if quarter == 4 or "翌期" in note or "翌事業年度" in note:
+        fiscal_date = fiscal_date + pd.DateOffset(years=1)
+
+    return fiscal_date.strftime("%Y-%m-%d")
+
+
+def forecast_numeric_direction(old_value, new_value, tolerance_percent=0.0):
+    try:
+        if old_value is None or new_value is None:
+            return 0
+
+        old_number = float(old_value)
+        new_number = float(new_value)
+    except Exception:
+        return 0
+
+    difference = new_number - old_number
+
+    if difference == 0:
+        return 0
+
+    if old_number != 0:
+        rate = abs(difference / old_number * 100)
+        if rate < tolerance_percent:
+            return 0
+
+    return 1 if difference > 0 else -1
+
+
+def forecast_revision_judgment(old_entry, new_entry):
+    core_keys = (
+        "forecast_revenue",
+        "forecast_operating_income",
+        "forecast_ordinary_income",
+        "forecast_net_income",
+    )
+
+    directions = [
+        forecast_numeric_direction(
+            old_entry.get(key),
+            new_entry.get(key),
+        )
+        for key in core_keys
+    ]
+
+    has_up = 1 in directions
+    has_down = -1 in directions
+
+    if has_up and has_down:
+        return "混合修正"
+    if has_up:
+        return "上方修正"
+    if has_down:
+        return "下方修正"
+
+    eps_direction = forecast_numeric_direction(
+        old_entry.get("forecast_eps"),
+        new_entry.get("forecast_eps"),
+        tolerance_percent=0.5,
+    )
+
+    if eps_direction > 0:
+        return "EPSのみ上方修正"
+    if eps_direction < 0:
+        return "EPSのみ下方修正"
+
+    return "予想維持"
+
+
+def forecast_operating_margin(entry):
+    try:
+        revenue = float(entry.get("forecast_revenue"))
+        operating_income = float(entry.get("forecast_operating_income"))
+    except Exception:
+        return None
+
+    if revenue == 0:
+        return None
+
+    return operating_income / revenue * 100
+
+
+def forecast_business_summary(first, latest):
+    revenue_direction = forecast_numeric_direction(
+        first.get("forecast_revenue"),
+        latest.get("forecast_revenue"),
+    )
+    profit_direction = forecast_numeric_direction(
+        first.get("forecast_operating_income"),
+        latest.get("forecast_operating_income"),
+    )
+
+    if revenue_direction > 0 and profit_direction > 0:
+        return "増収・増益"
+    if revenue_direction > 0 and profit_direction < 0:
+        return "増収・減益（採算悪化）"
+    if revenue_direction < 0 and profit_direction > 0:
+        return "減収・増益（採算改善）"
+    if revenue_direction < 0 and profit_direction < 0:
+        return "減収・減益"
+    if revenue_direction > 0 and profit_direction == 0:
+        return "増収・営業利益据え置き"
+    if revenue_direction < 0 and profit_direction == 0:
+        return "減収・営業利益据え置き"
+    if revenue_direction == 0 and profit_direction > 0:
+        return "売上据え置き・増益"
+    if revenue_direction == 0 and profit_direction < 0:
+        return "売上据え置き・減益"
+
+    return "売上・営業利益とも予想維持"
+
+
+def build_forecast_history_summary(earnings, latest):
+    grouped = {}
+
+    for row in earnings:
+        if not isinstance(row, dict):
+            continue
+
+        if not any(row.get(key) is not None for key in FORECAST_VALUE_KEYS):
+            continue
+
+        target_fye = forecast_target_fiscal_year_end(row)
+        if not target_fye:
+            continue
+
+        disclosure_date = format_disclosure_date(row.get("disclosure_date"))
+        entry = {
+            "target_fiscal_year_end": target_fye,
+            "disclosure_date": disclosure_date,
+            "source_fiscal_year_end": row.get("fiscal_year_end"),
+            "source_quarter": row.get("quarter"),
+        }
+
+        for key in FORECAST_VALUE_KEYS:
+            entry[key] = row.get(key)
+
+        grouped.setdefault(target_fye, {})[disclosure_date] = entry
+
+    latest_target_fye = forecast_target_fiscal_year_end(latest)
+    target_entries = grouped.get(latest_target_fye, {})
+    entries = sorted(
+        target_entries.values(),
+        key=lambda item: item["disclosure_date"],
+    )
+
+    if len(entries) < 2:
+        return None
+
+    core_revisions = {"上方修正", "下方修正", "混合修正"}
+    real_revision_count = sum(
+        forecast_revision_judgment(entries[index - 1], entries[index])
+        in core_revisions
+        for index in range(1, len(entries))
+    )
+
+    first = entries[0]
+    current = entries[-1]
+    previous = entries[-2]
+    first_margin = forecast_operating_margin(first)
+    current_margin = forecast_operating_margin(current)
+
+    return {
+        "target_fiscal_year_end": latest_target_fye,
+        "confirmation_count": len(entries),
+        "real_revision_count": real_revision_count,
+        "first_disclosure_date": first["disclosure_date"],
+        "latest_disclosure_date": current["disclosure_date"],
+        "latest_judgment": forecast_revision_judgment(previous, current),
+        "overall_judgment": forecast_revision_judgment(first, current),
+        "business_summary": forecast_business_summary(first, current),
+        "first_operating_margin": first_margin,
+        "latest_operating_margin": current_margin,
+        "first": first,
+        "previous": previous,
+        "latest": current,
+    }
+
+
+def fetch_earnings_summary(code):
+    api_key = os.getenv("EDINETDB_API_KEY")
+
+    if not api_key:
+        edinetdb_settings = get_secret_section("edinetdb")
+        api_key = edinetdb_settings.get("api_key")
+
+    if not api_key:
+        return {
+            "ok": False,
+            "message": "EDINET DBのAPIキーが見つかりません。"
+        }
+
+    search_result, error = edinet_request_json(
+        f"{EDINETDB_BASE_URL}/search",
+        api_key,
+        params={"q": code}
+    )
+
+    if error:
+        return {
+            "ok": False,
+            "message": f"企業検索に失敗しました（{error}）。"
+        }
+
+    companies = extract_list_from_data(search_result)
+
+    if not companies:
+        return {
+            "ok": False,
+            "message": "EDINET DBで企業を特定できませんでした。"
+        }
+
+    exact_matches = [
+        company
+        for company in companies
+        if str(company.get("sec_code", "")).startswith(code)
+    ]
+
+    company = exact_matches[0] if exact_matches else companies[0]
+
+    edinet_code = (
+        company.get("edinet_code")
+        or company.get("code")
+    )
+
+    if not edinet_code:
+        return {
+            "ok": False,
+            "message": "EDINETコードを取得できませんでした。"
+        }
+
+    earnings_result, error = edinet_request_json(
+        f"{EDINETDB_BASE_URL}/companies/{edinet_code}/earnings",
+        api_key,
+        params={"limit": 8}
+    )
+
+    if error:
+        return {
+            "ok": False,
+            "message": f"決算データ取得に失敗しました（{error}）。"
+        }
+
+    earnings = extract_list_from_data(earnings_result)
+
+    if not earnings:
+        return {
+            "ok": False,
+            "message": "決算データが見つかりませんでした。"
+        }
+
+    latest = earnings[0]
+    forecast_history = build_forecast_history_summary(earnings, latest)
+
+    fiscal_year_end = latest.get("fiscal_year_end")
+    quarter = latest.get("quarter")
+    disclosure_date = format_disclosure_date(latest.get("disclosure_date"))
+
+    revenue = latest.get("revenue")
+    operating_income = latest.get("operating_income")
+    ordinary_income = latest.get("ordinary_income")
+    net_income = latest.get("net_income")
+
+    forecast_revenue = latest.get("forecast_revenue")
+    forecast_operating_income = latest.get("forecast_operating_income")
+    forecast_ordinary_income = latest.get("forecast_ordinary_income")
+    forecast_net_income = latest.get("forecast_net_income")
+
+    revenue_progress = calc_progress_rate(
+        revenue,
+        forecast_revenue
+    )
+
+    operating_progress = calc_progress_rate(
+        operating_income,
+        forecast_operating_income
+    )
+
+    previous_forecast = None
+
+    if forecast_history:
+        previous = forecast_history["previous"]
+        previous_forecast = {
+            "disclosure_date": previous.get("disclosure_date"),
+            "forecast_revenue": previous.get("forecast_revenue"),
+            "forecast_operating_income": previous.get(
+                "forecast_operating_income"
+            ),
+            "forecast_ordinary_income": previous.get(
+                "forecast_ordinary_income"
+            ),
+            "forecast_net_income": previous.get("forecast_net_income"),
+        }
+
+    # 直近決算と同じ四半期の前年データを探す
+    year_ago = None
+
+    try:
+        latest_year = int(str(fiscal_year_end)[:4])
+        latest_quarter = str(quarter).upper()
+
+        for item in earnings[1:]:
+            item_fye = item.get("fiscal_year_end")
+            item_quarter = str(item.get("quarter")).upper()
+
+            if not item_fye:
+                continue
+
+            try:
+                item_year = int(str(item_fye)[:4])
+            except Exception:
+                continue
+
+            if item_year == latest_year - 1 and item_quarter == latest_quarter:
+                year_ago = {
+                    "fiscal_year_end": item.get("fiscal_year_end"),
+                    "quarter": item.get("quarter"),
+                    "disclosure_date": format_disclosure_date(
+                        item.get("disclosure_date")
+                    ),
+                    "revenue": item.get("revenue"),
+                    "operating_income": item.get("operating_income"),
+                    "ordinary_income": item.get("ordinary_income"),
+                    "net_income": item.get("net_income"),
+                }
+                break
+    except Exception:
+        year_ago = None
+
+    return {
+        "ok": True,
+        "fiscal_year_end": fiscal_year_end,
+        "quarter": quarter,
+        "disclosure_date": disclosure_date,
+        "revenue": revenue,
+        "operating_income": operating_income,
+        "ordinary_income": ordinary_income,
+        "net_income": net_income,
+        "revenue_change": latest.get("revenue_change"),
+        "operating_income_change": latest.get("operating_income_change"),
+        "ordinary_income_change": latest.get("ordinary_income_change"),
+        "net_income_change": latest.get("net_income_change"),
+        "forecast_revenue": forecast_revenue,
+        "forecast_operating_income": forecast_operating_income,
+        "forecast_ordinary_income": forecast_ordinary_income,
+        "forecast_net_income": forecast_net_income,
+        "forecast_revenue_change": latest.get("forecast_revenue_change"),
+        "forecast_operating_income_change": latest.get("forecast_operating_income_change"),
+        "forecast_ordinary_income_change": latest.get("forecast_ordinary_income_change"),
+        "forecast_net_income_change": latest.get("forecast_net_income_change"),
+        "revenue_progress": revenue_progress,
+        "operating_progress": operating_progress,
+        "previous_forecast": previous_forecast,
+        "forecast_history": forecast_history,
+        "year_ago": year_ago,
+    }
+
+
+def swing_grade(score):
+    if score >= 82:
+        return "A", "スイング候補としてかなり良好"
+    if score >= 68:
+        return "B", "スイング候補として十分"
+    if score >= 52:
+        return "C", "条件を見ながら検討"
+    return "D", "現時点では優先度低め"
+
+
+def calculate_earnings_adjustment(earnings, price_date=None):
+    """業績をスイング点へ反映する補正値（最大±12点）を返す。"""
+    if not earnings or not earnings.get("ok"):
+        return {
+            "total": 0,
+            "raw_total": 0,
+            "forecast": 0,
+            "actual": 0,
+            "margin": 0,
+            "freshness_rate": 1.0,
+            "days_since_disclosure": None,
+            "reasons": ["決算データを取得できないため補正なし"],
+        }
+
+    def number(value):
+        try:
+            return float(value) if value is not None else None
+        except Exception:
+            return None
+
+    reasons = []
+
+    # 1. 会社予想の修正（上方 +6 / 維持 0 / 下方 -8）
+    forecast_score = 0
+    history = earnings.get("forecast_history")
+    judgment = history.get("overall_judgment") if history else None
+
+    if judgment == "上方修正":
+        forecast_score = 6
+        reasons.append("会社予想の上方修正：+6点")
+    elif judgment == "下方修正":
+        forecast_score = -8
+        reasons.append("会社予想の下方修正：-8点")
+    elif judgment == "混合修正":
+        first = history.get("first", {})
+        latest = history.get("latest", {})
+        first_op = number(first.get("forecast_operating_income"))
+        latest_op = number(latest.get("forecast_operating_income"))
+        if first_op is not None and latest_op is not None:
+            if latest_op > first_op:
+                forecast_score = 4
+                reasons.append("会社予想は混合修正・営業利益は上方：+4点")
+            elif latest_op < first_op:
+                forecast_score = -6
+                reasons.append("会社予想は混合修正・営業利益は下方：-6点")
+            else:
+                reasons.append("会社予想は混合修正・営業利益は維持：0点")
+    elif judgment == "予想維持":
+        reasons.append("会社予想は維持：0点")
+    else:
+        reasons.append("会社予想の比較材料不足：0点")
+
+    # 2. 前年同四半期との実績比較（+4 ～ -5）
+    actual_score = 0
+    year_ago = earnings.get("year_ago")
+    current_rev = number(earnings.get("revenue"))
+    current_op = number(earnings.get("operating_income"))
+    previous_rev = number(year_ago.get("revenue")) if year_ago else None
+    previous_op = number(year_ago.get("operating_income")) if year_ago else None
+
+    rev_change = None
+    op_change = None
+    if current_rev is not None and previous_rev not in (None, 0):
+        rev_change = (current_rev - previous_rev) / abs(previous_rev) * 100
+    if current_op is not None and previous_op not in (None, 0):
+        op_change = (current_op - previous_op) / abs(previous_op) * 100
+
+    if current_op is not None and previous_op is not None:
+        if previous_op <= 0 < current_op:
+            actual_score = 4
+            reasons.append("営業利益が黒字転換：+4点")
+        elif previous_op > 0 > current_op:
+            actual_score = -5
+            reasons.append("営業利益が赤字転落：-5点")
+        elif previous_op < 0 and current_op < 0:
+            if current_op > previous_op:
+                actual_score = 2
+                reasons.append("営業赤字が縮小：+2点")
+            elif current_op < previous_op:
+                actual_score = -3
+                reasons.append("営業赤字が拡大：-3点")
+        elif op_change is not None:
+            if op_change >= 20 and rev_change is not None and rev_change >= 10:
+                actual_score = 4
+                reasons.append("売上・営業利益とも前年同期比で強い：+4点")
+            elif op_change >= 10 or (rev_change is not None and rev_change >= 10):
+                actual_score = 2
+                reasons.append("前年同期比でやや強い：+2点")
+            elif op_change <= -20 and rev_change is not None and rev_change <= -10:
+                actual_score = -5
+                reasons.append("売上・営業利益とも前年同期比で弱い：-5点")
+            elif op_change <= -10 or (rev_change is not None and rev_change <= -10):
+                actual_score = -3
+                reasons.append("前年同期比でやや弱い：-3点")
+            else:
+                reasons.append("前年同期比はおおむね横ばい：0点")
+    else:
+        reasons.append("前年同四半期の比較材料不足：0点")
+
+    # 3. 予想営業利益率の変化（+2 ～ -2）
+    margin_score = 0
+    if history:
+        first_margin = number(history.get("first_operating_margin"))
+        latest_margin = number(history.get("latest_operating_margin"))
+        if first_margin is not None and latest_margin is not None:
+            margin_change = latest_margin - first_margin
+            if margin_change >= 2:
+                margin_score = 2
+                reasons.append("予想営業利益率が2ポイント以上改善：+2点")
+            elif margin_change >= 0.5:
+                margin_score = 1
+                reasons.append("予想営業利益率が改善：+1点")
+            elif margin_change <= -2:
+                margin_score = -2
+                reasons.append("予想営業利益率が2ポイント以上悪化：-2点")
+            elif margin_change <= -0.5:
+                margin_score = -1
+                reasons.append("予想営業利益率が悪化：-1点")
+            else:
+                reasons.append("予想営業利益率はほぼ変化なし：0点")
+        else:
+            reasons.append("予想営業利益率の比較材料不足：0点")
+
+    raw_total = max(
+        -12,
+        min(12, forecast_score + actual_score + margin_score),
+    )
+
+    # 決算開示から時間が経つほど、スイング判断への影響を弱める。
+    # パソコンの現在日ではなく、分析対象の最新株価日を基準にする。
+    freshness_rate = 1.0
+    days_since_disclosure = None
+
+    try:
+        disclosure = pd.Timestamp(earnings.get("disclosure_date")).normalize()
+        market_date = pd.Timestamp(price_date).normalize()
+        days_since_disclosure = int((market_date - disclosure).days)
+
+        if days_since_disclosure < 0:
+            freshness_rate = 0.0
+            reasons.append("株価データ日より後の決算のため補正対象外")
+        elif days_since_disclosure <= 14:
+            freshness_rate = 1.0
+        elif days_since_disclosure <= 30:
+            freshness_rate = 0.8
+        elif days_since_disclosure <= 60:
+            freshness_rate = 0.6
+        elif days_since_disclosure <= 90:
+            freshness_rate = 0.4
+        else:
+            freshness_rate = 0.2
+    except Exception:
+        # 日付を比較できない場合は、従来どおり元の補正を使用する。
+        freshness_rate = 1.0
+        days_since_disclosure = None
+
+    adjusted_value = raw_total * freshness_rate
+    if adjusted_value >= 0:
+        total = int(adjusted_value + 0.5)
+    else:
+        total = -int(abs(adjusted_value) + 0.5)
+
+    return {
+        "total": total,
+        "raw_total": raw_total,
+        "forecast": forecast_score,
+        "actual": actual_score,
+        "margin": margin_score,
+        "freshness_rate": freshness_rate,
+        "days_since_disclosure": days_since_disclosure,
+        "reasons": reasons,
+    }
+
+
+def show_earnings_summary(earnings, price_date=None):
+    st.markdown("### 🧾 業績・決算")
+
+    if not earnings or not earnings.get("ok"):
+        message = (
+            earnings.get("message")
+            if isinstance(earnings, dict)
+            else "決算データを取得できませんでした。"
+        )
+        st.warning(message)
+        return
+
+    fiscal_year_end = earnings.get("fiscal_year_end", "不明")
+    quarter = earnings.get("quarter")
+
+    try:
+        fy_text = pd.Timestamp(fiscal_year_end).strftime("%Y年%m月期")
+    except Exception:
+        fy_text = str(fiscal_year_end)
+
+    quarter_text = f"{quarter}Q" if quarter is not None else "不明"
+
+    st.write(
+        f"**直近決算**　{fy_text} {quarter_text}　"
+        f"｜　開示日 {earnings['disclosure_date']}"
+    )
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("**実績（百万円）**")
+        st.write(
+            f"売上高：{format_financial_number(earnings['revenue'])}"
+        )
+        st.write(
+            f"営業利益：{format_financial_number(earnings['operating_income'])}"
+        )
+        st.write(
+            f"経常利益：{format_financial_number(earnings['ordinary_income'])}"
+        )
+        st.write(
+            f"純利益：{format_financial_number(earnings['net_income'])}"
+        )
+
+    with c2:
+        st.markdown("**通期会社予想（百万円）**")
+        st.write(
+            f"売上高：{format_financial_number(earnings['forecast_revenue'])}"
+        )
+        st.write(
+            f"営業利益：{format_financial_number(earnings['forecast_operating_income'])}"
+        )
+        st.write(
+            f"経常利益：{format_financial_number(earnings['forecast_ordinary_income'])}"
+        )
+        st.write(
+            f"純利益：{format_financial_number(earnings['forecast_net_income'])}"
+        )
+
+    st.markdown("**単純進捗率**")
+
+    revenue_progress = earnings.get("revenue_progress")
+    operating_progress = earnings.get("operating_progress")
+
+    if revenue_progress is None:
+        st.write("売上高：算出不可")
+    else:
+        st.write(f"売上高：{revenue_progress:.1f}%")
+
+    if operating_progress is None:
+        st.write("営業利益：算出不可")
+    else:
+        st.write(f"営業利益：{operating_progress:.1f}%")
+
+    # 前年同四半期との実額比較
+    st.markdown("**前年同四半期との比較**")
+
+    year_ago = earnings.get("year_ago")
+
+    def to_number(value):
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    def yoy_label(current, previous_value):
+        current_num = to_number(current)
+        previous_num = to_number(previous_value)
+
+        if current_num is None or previous_num is None:
+            return "比較不可"
+
+        if previous_num > 0 and current_num < 0:
+            return "赤字転落"
+
+        if previous_num < 0 and current_num > 0:
+            return "黒字転換"
+
+        if previous_num < 0 and current_num < 0:
+            if current_num > previous_num:
+                return "赤字縮小"
+            if current_num < previous_num:
+                return "赤字拡大"
+            return "赤字横ばい"
+
+        if previous_num == 0:
+            if current_num > 0:
+                return "黒字化"
+            if current_num < 0:
+                return "赤字化"
+            return "横ばい"
+
+        change = (current_num - previous_num) / abs(previous_num) * 100
+        return f"{change:+.1f}%"
+
+    if year_ago:
+        for label, current, previous_value in [
+            ("売上高", earnings.get("revenue"), year_ago.get("revenue")),
+            ("営業利益", earnings.get("operating_income"), year_ago.get("operating_income")),
+            ("経常利益", earnings.get("ordinary_income"), year_ago.get("ordinary_income")),
+            ("純利益", earnings.get("net_income"), year_ago.get("net_income")),
+        ]:
+            st.write(
+                f"{label}：{format_financial_number(previous_value)} → "
+                f"{format_financial_number(current)}"
+                f"（{yoy_label(current, previous_value)}）"
+            )
+    else:
+        st.write("前年同四半期データを取得できませんでした。")
+
+    rev_change = None
+    op_change = None
+
+    if year_ago:
+        current_rev = to_number(earnings.get("revenue"))
+        previous_rev = to_number(year_ago.get("revenue"))
+        current_op = to_number(earnings.get("operating_income"))
+        previous_op = to_number(year_ago.get("operating_income"))
+
+        if current_rev is not None and previous_rev not in (None, 0):
+            rev_change = (
+                (current_rev - previous_rev) / abs(previous_rev) * 100
+            )
+
+        if current_op is not None and previous_op not in (None, 0):
+            op_change = (
+                (current_op - previous_op) / abs(previous_op) * 100
+            )
+
+    previous = earnings.get("previous_forecast")
+    forecast_history = earnings.get("forecast_history")
+
+    st.markdown("**会社予想の流れ**")
+
+    if forecast_history:
+        try:
+            target_text = pd.Timestamp(
+                forecast_history["target_fiscal_year_end"]
+            ).strftime("%Y年%m月期")
+        except Exception:
+            target_text = str(
+                forecast_history.get("target_fiscal_year_end", "不明")
+            )
+
+        st.write(
+            f"{target_text}｜{forecast_history['overall_judgment']}｜"
+            f"{forecast_history['business_summary']}"
+        )
+        st.write(
+            f"予想確認 {forecast_history['confirmation_count']}回　｜　"
+            f"実質修正 {forecast_history['real_revision_count']}回　｜　"
+            f"直近判定 {forecast_history['latest_judgment']}"
+        )
+
+        first_margin = forecast_history.get("first_operating_margin")
+        latest_margin = forecast_history.get("latest_operating_margin")
+
+        if first_margin is not None and latest_margin is not None:
+            margin_change = latest_margin - first_margin
+            st.write(
+                f"予想営業利益率：{first_margin:.2f}% → "
+                f"{latest_margin:.2f}%（{margin_change:+.2f}ポイント）"
+            )
+
+        with st.expander("会社予想の履歴を見る"):
+            first_forecast = forecast_history["first"]
+            latest_forecast = forecast_history["latest"]
+            st.caption(
+                f"初回 {forecast_history['first_disclosure_date']} → "
+                f"最新 {forecast_history['latest_disclosure_date']}"
+            )
+            st.write(
+                "売上高："
+                f"{format_financial_number(first_forecast.get('forecast_revenue'))} → "
+                f"{format_financial_number(latest_forecast.get('forecast_revenue'))}"
+            )
+            st.write(
+                "営業利益："
+                f"{format_financial_number(first_forecast.get('forecast_operating_income'))} → "
+                f"{format_financial_number(latest_forecast.get('forecast_operating_income'))}"
+            )
+            st.write(
+                "経常利益："
+                f"{format_financial_number(first_forecast.get('forecast_ordinary_income'))} → "
+                f"{format_financial_number(latest_forecast.get('forecast_ordinary_income'))}"
+            )
+            st.write(
+                "純利益："
+                f"{format_financial_number(first_forecast.get('forecast_net_income'))} → "
+                f"{format_financial_number(latest_forecast.get('forecast_net_income'))}"
+            )
+    else:
+        st.write("同じ対象年度の会社予想が2回以上なく、履歴比較はできません。")
+
+    def compare_forecast(current, previous_value):
+        try:
+            current = float(current)
+            previous_value = float(previous_value)
+        except Exception:
+            return "比較不可", None
+
+        if previous_value == 0:
+            if current == 0:
+                return "据え置き", 0.0
+            return "変更", None
+
+        change_pct = (current - previous_value) / abs(previous_value) * 100
+
+        if abs(change_pct) < 0.01:
+            return "据え置き", 0.0
+        elif change_pct > 0:
+            return "上方修正", change_pct
+        else:
+            return "下方修正", change_pct
+
+    revenue_revision = ("比較不可", None)
+    op_revision = ("比較不可", None)
+
+    if previous:
+        revenue_revision = compare_forecast(
+            earnings.get("forecast_revenue"),
+            previous.get("forecast_revenue")
+        )
+        op_revision = compare_forecast(
+            earnings.get("forecast_operating_income"),
+            previous.get("forecast_operating_income")
+        )
+
+    st.markdown("**直近開示での会社予想の変化**")
+
+    if previous:
+        rev_label, rev_pct = revenue_revision
+        op_label, op_pct = op_revision
+
+        rev_suffix = (
+            f"（{rev_pct:+.1f}%）"
+            if rev_pct is not None and rev_label != "据え置き"
+            else ""
+        )
+        op_suffix = (
+            f"（{op_pct:+.1f}%）"
+            if op_pct is not None and op_label != "据え置き"
+            else ""
+        )
+
+        st.write(f"売上高：{rev_label}{rev_suffix}")
+        st.write(f"営業利益：{op_label}{op_suffix}")
+    else:
+        st.write("前回予想がないため比較不可")
+
+    # 簡易評価
+    score = 0
+    reasons = []
+
+    try:
+        if rev_change is not None:
+            rev_change_f = float(rev_change)
+            if rev_change_f >= 10:
+                score += 1
+                reasons.append("売上高は前年同期比で増加")
+            elif rev_change_f <= -10:
+                score -= 1
+                reasons.append("売上高は前年同期比で減少")
+    except Exception:
+        pass
+
+    # 営業利益の前年比が取得できない場合でも、
+    # 現在値が赤字かどうかは評価材料にする
+    operating_income = earnings.get("operating_income")
+
+    try:
+        current_op = to_number(operating_income)
+        previous_op = (
+            to_number(year_ago.get("operating_income"))
+            if year_ago
+            else None
+        )
+
+        if current_op is not None and previous_op is not None:
+            if previous_op > 0 and current_op < 0:
+                score -= 2
+                reasons.append("営業利益は前年同期の黒字から赤字転落")
+            elif previous_op < 0 and current_op > 0:
+                score += 2
+                reasons.append("営業利益は前年同期の赤字から黒字転換")
+            elif previous_op < 0 and current_op < 0:
+                if current_op > previous_op:
+                    score += 1
+                    reasons.append("営業赤字は前年同期より縮小")
+                elif current_op < previous_op:
+                    score -= 1
+                    reasons.append("営業赤字は前年同期より拡大")
+            elif op_change is not None:
+                if op_change >= 10:
+                    score += 2
+                    reasons.append("営業利益は前年同期比で増加")
+                elif op_change <= -10:
+                    score -= 2
+                    reasons.append("営業利益は前年同期比で減少")
+        elif current_op is not None and current_op < 0:
+            score -= 1
+            reasons.append("営業利益は赤字")
+    except Exception:
+        pass
+
+    rev_label, _ = revenue_revision
+    op_label, _ = op_revision
+
+    if rev_label == "上方修正":
+        score += 1
+        reasons.append("売上高会社予想を上方修正")
+    elif rev_label == "下方修正":
+        score -= 1
+        reasons.append("売上高会社予想を下方修正")
+    elif rev_label == "据え置き":
+        reasons.append("売上高会社予想は据え置き")
+
+    if op_label == "上方修正":
+        score += 2
+        reasons.append("営業利益会社予想を上方修正")
+    elif op_label == "下方修正":
+        score -= 2
+        reasons.append("営業利益会社予想を下方修正")
+    elif op_label == "据え置き":
+        reasons.append("営業利益会社予想は据え置き")
+
+    # 画面上の評価も、総合点に使う業績補正と同じ基準へ統一する
+    adjustment = calculate_earnings_adjustment(earnings, price_date)
+    score = adjustment["total"]
+    reasons = adjustment["reasons"]
+
+    if score >= 8:
+        earnings_view = "強め"
+        swing_effect = "追い風"
+    elif score >= 3:
+        earnings_view = "やや強め"
+        swing_effect = "やや追い風"
+    elif score <= -5:
+        earnings_view = "弱め"
+        swing_effect = "逆風"
+    elif score <= -1:
+        earnings_view = "やや弱め"
+        swing_effect = "やや逆風"
+    else:
+        earnings_view = "中立"
+        swing_effect = "中立"
+
+    st.markdown("**決算の簡易評価**")
+    st.write(f"業績評価：{earnings_view}")
+    st.write(f"スイングへの影響：{swing_effect}")
+    freshness_pct = adjustment["freshness_rate"] * 100
+    days = adjustment["days_since_disclosure"]
+    if days is None:
+        st.write(f"業績補正：{score:+d}点")
+    else:
+        st.write(
+            f"業績補正：{score:+d}点"
+            f"（元 {adjustment['raw_total']:+d}点 × 鮮度 {freshness_pct:.0f}%）"
+        )
+        st.write(f"情報の経過日数：開示から {days}日")
+
+    if reasons:
+        with st.expander("決算評価の理由"):
+            for reason in reasons:
+                st.write(f"・{reason}")
+    else:
+        st.caption("評価材料が少ないため、中立評価です。")
+
+    if previous:
+        current_rev = earnings.get("forecast_revenue")
+        previous_rev = previous.get("forecast_revenue")
+        current_op = earnings.get("forecast_operating_income")
+        previous_op = previous.get("forecast_operating_income")
+
+        if (
+            current_rev is not None
+            and previous_rev is not None
+            and current_op is not None
+            and previous_op is not None
+        ):
+            st.markdown("**前回開示時の会社予想との比較**")
+            st.caption(
+                f"比較対象の開示日：{previous['disclosure_date']}"
+            )
+            st.write(
+                "売上高："
+                f"{format_financial_number(previous_rev)} → "
+                f"{format_financial_number(current_rev)}"
+            )
+            st.write(
+                "営業利益："
+                f"{format_financial_number(previous_op)} → "
+                f"{format_financial_number(current_op)}"
+            )
+
+    st.caption(
+        "決算評価は、前年同四半期の実績と前回開示時の会社予想との実額比較による簡易判定です。"
+        "四半期ごとの季節性、特殊要因、会社固有の利益計上時期はまだ加味していません。"
+        "総合スイング適性には、業績補正として最大±12点を反映します。"
+    )
+
+
+# =========================================================
+# 表示
+# =========================================================
+def show_daytrade(result):
+    st.subheader("⚡ デイトレ分析")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.metric(
+            "デイトレ適性",
+            result["grade"],
+            f'{result["score"]} / 100'
+        )
+
+    with c2:
+        st.markdown("**判定**")
+        st.write(result["grade_text"])
+
+    st.write(f'**20日平均売買代金**　{result["turnover_oku"]:.1f} 億円')
+    st.write(f'**ATR**　{result["atr_pct"]:.2f}%')
+    st.write(f'**出来高倍率**　{result["volume_ratio"]:.2f} 倍')
+    st.write(f'**短期トレンド**　{result["trend"]}')
+    st.write(f'**現在位置**　{result["position"]}')
+
+    with st.expander("デイトレ分析のポイント"):
+        for comment in result["comments"]:
+            st.write(f"・{comment}")
+
+    st.info(
+        "詳しい方向性・重要価格・類似局面・地合いは"
+        "「株価展望」で確認してください。"
+    )
+
+
+def show_swing(result, earnings=None):
+    st.subheader("📊 スイング分析")
+
+    adjustment = calculate_earnings_adjustment(
+        earnings,
+        result.get("data_date"),
+    )
+    technical_score = result["score"]
+    total_score = max(0, min(100, technical_score + adjustment["total"]))
+    total_grade, total_grade_text = swing_grade(total_score)
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.metric(
+            "総合スイング適性",
+            total_grade,
+            f'{total_score} / 100'
+        )
+
+    with c2:
+        st.markdown("**判定**")
+        st.write(total_grade_text)
+
+    st.write(
+        f'**点数内訳**　テクニカル {technical_score}点　｜　'
+        f'業績補正 {adjustment["total"]:+d}点　｜　総合 {total_score}点'
+    )
+
+    with st.expander("業績補正の内訳"):
+        st.write(
+            f'元の内訳：会社予想 {adjustment["forecast"]:+d}点　｜　'
+            f'前年同期実績 {adjustment["actual"]:+d}点　｜　'
+            f'予想利益率 {adjustment["margin"]:+d}点'
+        )
+        days = adjustment["days_since_disclosure"]
+        freshness_pct = adjustment["freshness_rate"] * 100
+        if days is not None:
+            st.write(
+                f'鮮度調整：元 {adjustment["raw_total"]:+d}点 × '
+                f'{freshness_pct:.0f}%（開示から{days}日）'
+                f' → {adjustment["total"]:+d}点'
+            )
+        for reason in adjustment["reasons"]:
+            st.write(f"・{reason}")
+
+    st.write(f'**トレンド**　{result["trend"]}')
+    st.write(f'**60日内の位置**　{result["position"]}')
+    st.write(f'**20日騰落率**　{result["return20"]:+.1f}%')
+    st.write(f'**60日騰落率**　{result["return60"]:+.1f}%')
+    st.write(
+        f'**出来高**　{result["volume_ratio"]:.2f}倍'
+        f'（{result["volume_label"]}）'
+    )
+    st.write(
+        f'**ATR**　{result["atr_pct"]:.2f}%'
+        f'（{result["volatility_label"]}）'
+    )
+
+    st.markdown("**移動平均線**")
+    st.write(
+        f'5日線 {result["ma5"]:.1f}　｜　'
+        f'25日線 {result["ma25"]:.1f}　｜　'
+        f'75日線 {result["ma75"]:.1f}'
+    )
+
+    st.markdown("**簡易支持・抵抗**")
+    st.write(
+        f'支持候補：{result["support"]:.1f} 円　｜　'
+        f'抵抗候補：{result["resistance"]:.1f} 円'
+    )
+
+    with st.expander("スイング分析のポイント"):
+        for comment in result["comments"]:
+            st.write(f"・{comment}")
+
+    st.divider()
+    show_earnings_summary(earnings, result.get("data_date"))
+
+    st.caption(
+        "総合点はテクニカル100点に鮮度調整後の業績補正を加え、"
+        "0～100点の範囲に収めています。"
+    )
+
+
+# =========================================================
+# メイン画面
+# =========================================================
+st.title("🔍 銘柄選定お助けマン")
+
+mode = st.radio(
+    "何をしますか？",
+    [
+        "気になる銘柄を調べる",
+        "候補銘柄を探す"
+    ]
+)
+
+
+if mode == "気になる銘柄を調べる":
+
+    code_input = st.text_input(
+        "銘柄コード",
+        placeholder="例：6526",
+        key="stock_code_input"
+    )
+
+    st.markdown("### 投資スタイルを選択")
+
+    daytrade = st.checkbox("⚡ デイトレ")
+    swing = st.checkbox("📊 スイング")
+    longterm = st.checkbox("🏢 中長期")
+
+    selected_styles = []
+
+    if daytrade:
+        selected_styles.append("daytrade")
+
+    if swing:
+        selected_styles.append("swing")
+
+    if longterm:
+        selected_styles.append("longterm")
+
+    analyze_button = st.button(
+        "分析する",
+        type="primary",
+        use_container_width=True
+    )
+
+    if analyze_button:
+
+        code = normalize_code(code_input)
+
+        if not code.isdigit():
+            st.error("銘柄コードは数字で入力してください。")
+
+        elif not selected_styles:
+            st.warning("投資スタイルを1つ以上選んでください。")
+
+        else:
+            with st.spinner("株価データを分析しています..."):
+
+                data = download_stock_data(code)
+
+                if data is None:
+                    st.error(
+                        "株価データを取得できませんでした。"
+                        "銘柄コードを確認してください。"
+                    )
+
+                else:
+                    ticker = f"{code}.T"
+                    company = get_company_name(ticker)
+
+                    result = {}
+
+                    if "daytrade" in selected_styles:
+                        result["daytrade"] = analyze_daytrade(data)
+
+                    if "swing" in selected_styles:
+                        result["swing"] = analyze_swing(data)
+                        result["swing_earnings"] = fetch_earnings_summary(code)
+
+                    if "longterm" in selected_styles:
+                        result["longterm"] = None
+
+                    st.session_state.helper_result = result
+                    st.session_state.helper_code = code
+                    st.session_state.helper_company = company
+                    st.session_state.helper_date = (
+                        pd.Timestamp(data.index[-1]).strftime("%Y-%m-%d")
+                    )
+                    st.session_state.helper_styles = selected_styles
+
+                    st.rerun()
+
+    # -----------------------------------------------------
+    # 分析結果
+    # -----------------------------------------------------
+    if st.session_state.helper_result is not None:
+
+        st.divider()
+
+        code = st.session_state.helper_code
+        company = st.session_state.helper_company
+        data_date = st.session_state.helper_date
+        result = st.session_state.helper_result
+
+        st.header(f"{code} {company}")
+        st.caption(f"データ日：{data_date}")
+
+        if "daytrade" in result:
+            show_daytrade(result["daytrade"])
+
+        if "swing" in result:
+            st.divider()
+            show_swing(
+                result["swing"],
+                result.get("swing_earnings")
+            )
+
+        if "longterm" in result:
+            st.divider()
+            st.subheader("🏢 中長期分析")
+            st.info(
+                "業績・財務・長期チャート・目標株価・"
+                "企業行動パターンなどを順番に実装します。"
+            )
+
+        st.divider()
+
+        st.button(
+            "🔄 別の銘柄を調べる",
+            use_container_width=True,
+            on_click=reset_analysis
+        )
+
+
+else:
+    st.info(
+        "「候補銘柄を探す」は次の段階で実装します。"
+        "デイトレ・スイング・中長期を別々にランキングする予定です。"
+    )
+
+
+st.divider()
+
+st.caption(
+    "分析結果は売買を保証するものではなく、"
+    "投資判断の参考情報として表示しています。"
+)
