@@ -5,6 +5,11 @@ import numpy as np
 import os
 import requests
 import hmac
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from email.utils import parsedate_to_datetime
 
 
@@ -143,6 +148,115 @@ def reset_analysis():
 
 
 # =========================================================
+# 株価展望（旧 stock_ai.py をクラウドから呼び出す）
+# =========================================================
+def find_outlook_value(text, label):
+    pattern = rf"{re.escape(label)}\s*:\s*(.+)"
+    match = re.search(pattern, text)
+    return match.group(1).strip() if match else "-"
+
+
+def compact_outlook_price(value):
+    return value.replace("円付近", "").replace("円", "").strip()
+
+
+def parse_stock_outlook(output):
+    direction = find_outlook_value(output, "方向性")
+    volatility = find_outlook_value(output, "値動き傾向")
+    confidence = find_outlook_value(output, "予測信頼度")
+    market = {
+        "japan": find_outlook_value(output, "日本株地合い"),
+        "us_tech": find_outlook_value(output, "米国ハイテク"),
+        "semiconductor": find_outlook_value(output, "半導体地合い"),
+        "asia": find_outlook_value(output, "アジア地合い"),
+        "fx": find_outlook_value(output, "為替環境"),
+        "total": find_outlook_value(output, "総合地合い"),
+    }
+
+    zones = {
+        "up": {"first": "-", "middle": "-", "main": "-", "major": "-"},
+        "down": {"first": "-", "middle": "-", "main": "-", "major": "-"},
+    }
+    current_direction = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped == "【上方向】":
+            current_direction = "up"
+            continue
+        if stripped == "【下方向】":
+            current_direction = "down"
+            continue
+        if current_direction not in zones:
+            continue
+        value = line.split(":", 1)[-1].strip() if ":" in line else "-"
+        if "① 最初の分岐" in line:
+            zones[current_direction]["first"] = value
+        elif "途中警戒" in line:
+            zones[current_direction]["middle"] = value
+        elif "② 本命分岐" in line:
+            zones[current_direction]["main"] = value
+        elif "③ 大きな節目" in line:
+            zones[current_direction]["major"] = value
+
+    detail_lines = output.splitlines()
+    detail_start = next(
+        (
+            index
+            for index, line in enumerate(detail_lines)
+            if "今日のデイトレ展望" in line
+        ),
+        0,
+    )
+    return {
+        "direction": direction,
+        "volatility": volatility,
+        "confidence": confidence,
+        "market": market,
+        "zones": zones,
+        "detail": "\n".join(detail_lines[detail_start:]),
+    }
+
+
+def run_stock_outlook(code):
+    script_path = Path(__file__).parent / "stock_ai.py"
+    if not script_path.exists():
+        return {
+            "error": "株価展望エンジンが見つかりません。stock_ai.py を同じ場所へ追加してください。"
+        }
+
+    environment = os.environ.copy()
+    environment["STOCK_AI_SKIP_EXPORT"] = "1"
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            completed = subprocess.run(
+                [sys.executable, str(script_path)],
+                input=f"{code}\n",
+                text=True,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=temp_dir,
+                env=environment,
+                timeout=180,
+            )
+    except subprocess.TimeoutExpired:
+        return {"error": "株価展望の計算に時間がかかりすぎました。もう一度お試しください。"}
+    except Exception as exc:
+        return {"error": f"株価展望を開始できませんでした：{exc}"}
+
+    output = completed.stdout or ""
+    if not output.strip():
+        return {"error": "株価展望の結果を取得できませんでした。"}
+    if "株価データを取得できませんでした" in output:
+        return {"error": "株価展望用の株価データを取得できませんでした。"}
+
+    result = parse_stock_outlook(output)
+    if completed.returncode != 0:
+        result["warning"] = "一部の参考データを取得できず、表示を簡略化している可能性があります。"
+    return result
+
+
+# =========================================================
 # 共通処理
 # =========================================================
 def normalize_code(code):
@@ -235,6 +349,7 @@ def analyze_daytrade(data):
     df["Low20"] = df["Low"].rolling(20).min()
 
     latest = df.iloc[-1]
+    previous = df.iloc[-2]
 
     close = float(latest["Close"])
     ma5 = float(latest["MA5"])
@@ -245,6 +360,9 @@ def analyze_daytrade(data):
     turnover20 = float(latest["Turnover20"])
     high20 = float(latest["High20"])
     low20 = float(latest["Low20"])
+    prev_close = float(previous["Close"])
+    prev_high = float(previous["High"])
+    prev_low = float(previous["Low"])
 
     atr_pct = atr14 / close * 100 if close > 0 else 0
     volume_ratio = volume / volume20 if volume20 > 0 else 0
@@ -377,6 +495,38 @@ def analyze_daytrade(data):
     comments.append(f"短期トレンドは「{trend_label}」です。")
     comments.append(f"現在位置は「{position_label}」です。")
 
+    # -----------------------------------------------------------------
+    # 当日デイトレ展望（前日の日足を基準にした朝の準備用）
+    # -----------------------------------------------------------------
+    close_vs_ma5_pct = (close / ma5 - 1) * 100 if ma5 > 0 else 0
+    if ma_gap_pct >= 0.8 and close_vs_ma5_pct >= 0:
+        outlook = "上方向優勢"
+        outlook_detail = "前日高値を上抜けて維持できるかを確認する局面です。"
+        invalidation = "前日安値を明確に割れるなら、上目線は一度取り消しです。"
+    elif ma_gap_pct <= -0.8 and close_vs_ma5_pct <= 0:
+        outlook = "下方向警戒"
+        outlook_detail = "前日安値を割るか、戻りが前日高値で抑えられるかを確認する局面です。"
+        invalidation = "前日高値を上抜けて維持するなら、下目線は一度取り消しです。"
+    else:
+        outlook = "上下拮抗"
+        outlook_detail = "寄り後に前日高値・安値のどちらを先に抜けて維持するかを待つ局面です。"
+        invalidation = "どちらかの前日値を抜けて維持した側を、その日の優先方向として見ます。"
+
+    confidence_points = 0
+    if abs(ma_gap_pct) >= 2:
+        confidence_points += 1
+    if volume_ratio >= 1.4:
+        confidence_points += 1
+    if atr_pct >= 2:
+        confidence_points += 1
+
+    if confidence_points >= 3:
+        outlook_confidence = "高め"
+    elif confidence_points >= 2:
+        outlook_confidence = "中"
+    else:
+        outlook_confidence = "低め"
+
     return {
         "score": int(total),
         "grade": grade,
@@ -388,7 +538,17 @@ def analyze_daytrade(data):
         "trend": trend_label,
         "ma_gap_pct": ma_gap_pct,
         "position": position_label,
-        "comments": comments
+        "comments": comments,
+        "outlook": outlook,
+        "outlook_detail": outlook_detail,
+        "outlook_confidence": outlook_confidence,
+        "invalidation": invalidation,
+        "prev_close": prev_close,
+        "prev_high": prev_high,
+        "prev_low": prev_low,
+        "atr14": atr14,
+        "up_target": prev_close + atr14,
+        "down_target": max(0, prev_close - atr14),
     }
 
 
@@ -1722,8 +1882,81 @@ def show_earnings_summary(earnings, price_date=None):
 # =========================================================
 # 表示
 # =========================================================
+def show_stock_outlook(result):
+    st.subheader("📈 今日の株価展望")
+
+    if result.get("error"):
+        st.warning(result["error"])
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("方向性", result["direction"])
+    with c2:
+        st.metric("値動き", result["volatility"])
+    with c3:
+        st.metric("信頼度", result["confidence"])
+
+    zones = result["zones"]
+    up_prices = [
+        compact_outlook_price(zones["up"][key])
+        for key in ("first", "middle", "main", "major")
+        if zones["up"][key] != "-"
+    ]
+    down_prices = [
+        compact_outlook_price(zones["down"][key])
+        for key in ("first", "middle", "main", "major")
+        if zones["down"][key] != "-"
+    ]
+
+    st.markdown("**今日の重要価格**")
+    st.write(f'↑ 上方向　{" → ".join(up_prices) if up_prices else "取得できませんでした"}')
+    st.write(f'↓ 下方向　{" → ".join(down_prices) if down_prices else "取得できませんでした"}')
+
+    market = result["market"]
+    st.markdown("**地合い**")
+    st.write(f'総合：{market["total"]}')
+    with st.expander("地合いの内訳"):
+        st.write(f'日本株：{market["japan"]}')
+        st.write(f'米国ハイテク：{market["us_tech"]}')
+        st.write(f'半導体：{market["semiconductor"]}')
+        st.write(f'アジア：{market["asia"]}')
+        st.write(f'為替：{market["fx"]}')
+
+    if result.get("warning"):
+        st.caption(result["warning"])
+
+    with st.expander("株価展望の詳しい分析を見る"):
+        st.text(result["detail"])
+
+
 def show_daytrade(result):
-    st.subheader("⚡ デイトレ分析")
+    st.subheader("☀️ 今日のデイトレ展望")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**基本目線**")
+        st.write(result["outlook"])
+    with c2:
+        st.markdown("**信頼度**")
+        st.write(result["outlook_confidence"])
+
+    st.write(result["outlook_detail"])
+
+    st.markdown("**朝に見る分岐ライン**")
+    st.write(
+        f'上の分岐：前日高値 {result["prev_high"]:.1f} 円　｜　'
+        f'下の分岐：前日安値 {result["prev_low"]:.1f} 円'
+    )
+    st.write(
+        f'目安の上値：{result["up_target"]:.1f} 円　｜　'
+        f'目安の下値：{result["down_target"]:.1f} 円　'
+        f'（ATR14：{result["atr14"]:.1f} 円）'
+    )
+    st.caption(result["invalidation"])
+
+    st.divider()
+    st.subheader("⚡ デイトレ適性")
 
     c1, c2 = st.columns(2)
 
@@ -1749,8 +1982,7 @@ def show_daytrade(result):
             st.write(f"・{comment}")
 
     st.info(
-        "詳しい方向性・重要価格・類似局面・地合いは"
-        "「株価展望」で確認してください。"
+        "上の「今日の株価展望」で、重要価格・類似局面・地合いを確認できます。"
     )
 
 
@@ -1912,6 +2144,7 @@ if mode == "気になる銘柄を調べる":
                     result = {}
 
                     if "daytrade" in selected_styles:
+                        result["outlook"] = run_stock_outlook(code)
                         result["daytrade"] = analyze_daytrade(data)
 
                     if "swing" in selected_styles:
@@ -1946,7 +2179,12 @@ if mode == "気になる銘柄を調べる":
         st.header(f"{code} {company}")
         st.caption(f"データ日：{data_date}")
 
+        if "outlook" in result:
+            show_stock_outlook(result["outlook"])
+
         if "daytrade" in result:
+            if "outlook" in result:
+                st.divider()
             show_daytrade(result["daytrade"])
 
         if "swing" in result:
