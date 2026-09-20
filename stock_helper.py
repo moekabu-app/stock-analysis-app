@@ -989,9 +989,9 @@ def analyze_swing(data):
 
 
 def score_longterm_fundamentals(earnings, price_date=None):
-    """中長期専用：比較可能な業績資料を70点換算。資料欠損は0点扱いしない。"""
+    """中長期用の実績・通期見通しを70点で参考採点する（簡易・独自ルール）。"""
     empty = {"score": None, "coverage": 0, "provisional": True, "components": [],
-             "reasons": ["業績データを取得できないため、業績点は算出しません。"]}
+             "reasons": ["業績データを取得できないため、業績点は算出しません。"], "notes": []}
     if not isinstance(earnings, dict) or not earnings.get("ok"):
         return empty
 
@@ -999,7 +999,7 @@ def score_longterm_fundamentals(earnings, price_date=None):
         disclosure = pd.Timestamp(earnings.get("disclosure_date"))
         price = pd.Timestamp(price_date)
         if pd.notna(disclosure) and pd.notna(price) and disclosure.normalize() > price.normalize():
-            return {**empty, "reasons": ["分析対象の株価日より後に公表された決算は使いません。"]}
+            return {**empty, "reasons": ["株価基準日より後の決算は採点に使用しません。"]}
     except (TypeError, ValueError):
         pass
 
@@ -1010,79 +1010,109 @@ def score_longterm_fundamentals(earnings, price_date=None):
         except (TypeError, ValueError):
             return None
 
+    def change(current, previous):
+        return (current - previous) / abs(previous) * 100 if (
+            current is not None and previous is not None and previous > 0) else None
+
     components = []
+    notes = []
+
     def add(label, score, maximum, explanation):
         components.append({"label": label, "score": score, "max": maximum,
                            "explanation": explanation})
 
-    # 会社予想の同一年度内の初回→最新比較（20点）。履歴のない銘柄は採点対象外。
-    history = earnings.get("forecast_history")
+    history = earnings.get("forecast_history") or {}
+    previous = earnings.get("year_ago") or {}
+    rev, op = num(earnings.get("revenue")), num(earnings.get("operating_income"))
+    prev_rev, prev_op = num(previous.get("revenue")), num(previous.get("operating_income"))
+    forecast_rev = num(earnings.get("forecast_revenue"))
+    forecast_op = num(earnings.get("forecast_operating_income"))
+    prior_annual = earnings.get("previous_annual_actual") or {}
+    annual_rev = num(prior_annual.get("revenue"))
+    annual_op = num(prior_annual.get("operating_income"))
+
+    # 実績20点：同一四半期・同一集計期間だけを比較する。
+    if op is not None and prev_op is not None:
+        if prev_op <= 0 < op:
+            pts, desc = 20, "営業利益が黒字転換"
+        elif prev_op >= 0 > op:
+            pts, desc = 0, "営業利益が赤字転落"
+        elif prev_op < 0 and op < 0:
+            pts, desc = (10 if op > prev_op else 0), ("営業赤字が縮小" if op > prev_op else "営業赤字が拡大または横ばい")
+        elif prev_op > 0:
+            rate = change(op, prev_op)
+            pts = 16 if rate >= 20 else 13 if rate >= 10 else 10 if rate >= 0 else 5 if rate > -20 else 0
+            desc = f"営業利益の前年同期比 {rate:+.1f}%"
+        else:
+            pts, desc = (10 if op == 0 else 0), "営業利益がゼロ付近"
+        rev_rate = change(rev, prev_rev)
+        if rev_rate is not None:
+            pts = min(20, max(0, pts + (4 if rev_rate >= 10 else -4 if rev_rate <= -10 else 0)))
+            desc += f"、売上高 {rev_rate:+.1f}%"
+        add("前年同期の実績", pts, 20, desc)
+
+    # 通期見通し25点：前期通期の確定実績と当期通期予想を比較。
+    # 同じ対象年度の比較先を特定できない場合は欠損扱い（四半期実績とは比較しない）。
+    if forecast_op is not None and annual_op is not None:
+        if annual_op <= 0 < forecast_op:
+            pts, desc = 25, "通期営業利益は黒字転換予想"
+        elif annual_op >= 0 > forecast_op:
+            pts, desc = 0, "通期営業利益は赤字転落予想"
+        elif annual_op < 0 and forecast_op < 0:
+            pts = 12 if forecast_op > annual_op else 0
+            desc = "通期営業赤字は縮小予想" if pts else "通期営業赤字は拡大または横ばい予想"
+        elif annual_op > 0:
+            rate = change(forecast_op, annual_op)
+            pts = 20 if rate >= 20 else 17 if rate >= 10 else 13 if rate >= 0 else 7 if rate > -20 else 0
+            desc = f"通期営業利益の前期比予想 {rate:+.1f}%"
+        else:
+            pts, desc = (12 if forecast_op == 0 else 0), "通期営業利益はゼロ付近の予想"
+        rev_rate = change(forecast_rev, annual_rev)
+        if rev_rate is not None:
+            pts = min(25, max(0, pts + (5 if rev_rate >= 10 else -5 if rev_rate <= -10 else 0)))
+            desc += f"、売上高 {rev_rate:+.1f}%"
+        add("通期会社予想と前期実績", pts, 25, desc)
+    else:
+        notes.append("通期会社予想と前期実績：対応する前期通期実績または当期予想がなく、採点対象外。")
+
+    # 会社予想の修正15点：初回→最新（同一年度）。予想履歴がなければ欠損。
     if history:
         judgment = history.get("overall_judgment")
-        scores = {"上方修正": 20, "予想維持": 10, "下方修正": 0,
-                  "EPSのみ上方修正": 13, "EPSのみ下方修正": 7}
+        scores = {"上方修正": 15, "予想維持": 8, "下方修正": 0,
+                  "EPSのみ上方修正": 10, "EPSのみ下方修正": 5}
         if judgment in scores:
-            add("会社予想の修正", scores[judgment], 20, f"初回から最新：{judgment}")
+            add("会社予想の修正", scores[judgment], 15, f"同一年度の初回から最新：{judgment}")
         elif judgment == "混合修正":
             first = num((history.get("first") or {}).get("forecast_operating_income"))
             latest = num((history.get("latest") or {}).get("forecast_operating_income"))
             if first is not None and latest is not None:
-                points = 14 if latest > first else 6 if latest < first else 10
-                add("会社予想の修正", points, 20, "混合修正：営業利益の方向を優先")
+                pts = 11 if latest > first else 4 if latest < first else 8
+                add("会社予想の修正", pts, 15, "混合修正：営業利益予想の変更方向を参考")
 
-    # 同一四半期の前年実績を比較（25点）。赤字・黒字の変化を先に扱う。
-    previous = earnings.get("year_ago") or {}
-    revenue, op = num(earnings.get("revenue")), num(earnings.get("operating_income"))
-    prev_rev, prev_op = num(previous.get("revenue")), num(previous.get("operating_income"))
-    if op is not None and prev_op is not None:
-        if prev_op <= 0 < op:
-            pts, desc = 25, "営業利益が黒字転換"
-        elif prev_op >= 0 > op:
-            pts, desc = 0, "営業利益が赤字転落"
-        elif prev_op < 0 and op < 0:
-            pts, desc = (12 if op > prev_op else 0), "営業赤字の縮小・拡大"
-        elif prev_op > 0:
-            op_rate = (op - prev_op) / prev_op * 100
-            rev_rate = ((revenue - prev_rev) / abs(prev_rev) * 100
-                        if revenue is not None and prev_rev not in (None, 0) else None)
-            pts = (20 if op_rate >= 20 else 16 if op_rate >= 10 else 12
-                   if op_rate >= 0 else 7 if op_rate > -20 else 0)
-            if rev_rate is not None:
-                pts = max(0, min(25, pts + (5 if rev_rate >= 10 else -5 if rev_rate <= -10 else 0)))
-            desc = f"営業利益前年比 {op_rate:+.1f}%" + (
-                f"、売上前年比 {rev_rate:+.1f}%" if rev_rate is not None else "（売上前年比不明）")
-        else:
-            pts, desc = (12 if op == 0 else 0), "前年・当年の営業利益がゼロ付近"
-        add("前年同四半期の業績", pts, 25, desc)
+    # 予想利益率10点：四半期の一時的な赤字と通期の予想利益率は別々に見せる。
+    if forecast_rev is not None and forecast_rev > 0 and forecast_op is not None:
+        margin = forecast_op / forecast_rev * 100
+        pts = 10 if margin >= 15 else 8 if margin >= 10 else 6 if margin >= 5 else 3 if margin >= 0 else 0
+        add("通期予想営業利益率", pts, 10, f"会社予想の営業利益率 {margin:.1f}%")
 
-    # 営業利益率の水準（15点）：同じ会計期間の売上・営業利益を使用。
-    if revenue is not None and revenue > 0 and op is not None:
-        margin = op / revenue * 100
-        pts = (15 if margin >= 15 else 12 if margin >= 10 else 9
-               if margin >= 5 else 5 if margin >= 0 else 0)
-        add("営業利益率の水準", pts, 15, f"直近決算の営業利益率 {margin:.1f}%")
-
-    # 初回→最新の予想営業利益率差（10点）。比較不能なら分母から除外。
-    if history:
-        before, after = num(history.get("first_operating_margin")), num(history.get("latest_operating_margin"))
-        if before is not None and after is not None:
-            delta = after - before
-            pts = (10 if delta >= 2 else 7 if delta >= 0.5 else 5
-                   if delta > -0.5 else 3 if delta > -2 else 0)
-            add("予想営業利益率の変化", pts, 10, f"初回比 {delta:+.2f}ポイント")
+    if rev is not None and rev > 0 and op is not None:
+        notes.append(f"直近決算の営業利益率 {op/rev*100:+.1f}%（実績の前年比とあわせて参照）")
+    progress = num(earnings.get("operating_progress"))
+    if progress is not None:
+        notes.append(f"営業利益の単純進捗率 {progress:+.1f}%（季節性を補正していないため加点・減点なし）")
+    notes.append("会社予想は未達の可能性があり、実績とは区別して表示しています。")
 
     maximum = sum(item["max"] for item in components)
-    # 40点分以上の根拠がなければ数字を出さない。未取得を中立点とみなさない。
-    if maximum < 40:
+    if maximum < 45:
         return {"score": None, "coverage": maximum, "provisional": True,
-                "components": components,
-                "reasons": ["比較可能な業績指標が40/70点分に満たないため採点保留。"]}
+                "components": components, "notes": notes,
+                "reasons": ["採点可能な根拠が45/70点分に満たないため採点保留。"]}
     raw = sum(item["score"] for item in components)
-    scaled = int(raw / maximum * 70 + 0.5)
-    return {"score": scaled, "coverage": maximum,
-            "provisional": maximum < 70, "components": components,
-            "reasons": ["欠損項目を除き、採点可能な項目を70点満点へ換算。" if maximum < 70
-                        else "4項目を合計して70点満点で採点。"]}
+    score = int(raw / maximum * 70 + 0.5)
+    return {"score": score, "coverage": maximum, "provisional": maximum < 70,
+            "components": components, "notes": notes,
+            "reasons": ["採点できた項目のみを70点満点へ換算した暫定点です。" if maximum < 70
+                        else "4項目を合計した簡易参考点です。"]}
 
 
 # =========================================================
@@ -1552,6 +1582,23 @@ def fetch_earnings_summary(code):
 
     latest = earnings[0]
     forecast_history = build_forecast_history_summary(earnings, latest)
+    # 会社予想が対象とする期の直前の通期確定実績だけを比較対象にする。
+    # Q4時点で翌期の会社予想が載るケースにも対応する。
+    target_fye = forecast_target_fiscal_year_end(latest)
+    previous_annual_actual = None
+    try:
+        prior_fye = (pd.Timestamp(target_fye) - pd.DateOffset(years=1)).strftime("%Y-%m-%d")
+        for item in earnings:
+            if (str(item.get("fiscal_year_end"))[:10] == prior_fye
+                    and str(item.get("quarter")).upper() in ("4", "Q4")):
+                previous_annual_actual = {
+                    "fiscal_year_end": prior_fye,
+                    "revenue": item.get("revenue"),
+                    "operating_income": item.get("operating_income"),
+                }
+                break
+    except (TypeError, ValueError):
+        pass
 
     fiscal_year_end = latest.get("fiscal_year_end")
     quarter = latest.get("quarter")
@@ -1653,6 +1700,7 @@ def fetch_earnings_summary(code):
         "operating_progress": operating_progress,
         "previous_forecast": previous_forecast,
         "forecast_history": forecast_history,
+        "previous_annual_actual": previous_annual_actual,
         "year_ago": year_ago,
     }
 
@@ -2396,6 +2444,8 @@ def show_longterm(result, earnings=None):
                 st.caption(f'4項目合計 {raw_points}/70点 → 業績 {fundamental["score"]}点')
     else:
         st.caption("採点できる業績データがありません。")
+    for note in fundamental.get("notes", []):
+        st.caption(f"・{note}")
     if fundamental["provisional"] and fundamental["score"] is not None:
         st.warning(f'業績資料の充足度 {fundamental["coverage"]}/70点分：欠損項目を除いた暫定点です。')
     elif fundamental["score"] is None:
@@ -2428,7 +2478,7 @@ def show_longterm(result, earnings=None):
             st.caption(reason)
         show_earnings_summary(earnings)
 
-    st.caption("中長期適性は、業績70点・長期チャート30点の参考指標です。業績の点数は独立した中長期用基準で算定し、決算発表からの日数では減衰しません。")
+    st.caption("中長期適性は独自の簡易参考指標（業績70点・長期チャート30点）です。実績と会社予想を別項目で採点し、予想の実現や投資成果を保証しません。会社予想の達成可能性・前期実績の確認は別途必要です。")
 
 
 def show_swing(result, earnings=None):
