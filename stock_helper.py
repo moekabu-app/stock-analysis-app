@@ -54,7 +54,12 @@ def require_cloud_login():
             st.login()
         st.stop()
 
-    user_email = str(st.user.get("email", "")).strip().lower()
+    # Streamlitの版によっては st.user が dict 風でも .get() を持たない。
+    # 添字アクセスに統一し、メール情報がない場合だけ許可しない。
+    try:
+        user_email = str(st.user["email"]).strip().lower()
+    except (KeyError, TypeError, AttributeError):
+        user_email = ""
     allowed_emails = {
         str(email).strip().lower()
         for email in app_settings.get("allowed_emails", [])
