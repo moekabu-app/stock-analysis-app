@@ -54,7 +54,10 @@ def require_cloud_login():
         st.write("利用を許可された方専用です。")
         entered_passcode = st.text_input("合言葉", type="password") or ""
         if st.button("入る"):
-            if hmac.compare_digest(str(entered_passcode), expected_passcode):
+            if hmac.compare_digest(
+                str(entered_passcode).encode("utf-8"),
+                expected_passcode.encode("utf-8"),
+            ):
                 st.session_state.cloud_access_granted = True
                 st.rerun()
             else:
