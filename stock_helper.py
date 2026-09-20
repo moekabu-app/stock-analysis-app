@@ -2444,64 +2444,90 @@ def show_daytrade(result):
 
 
 def show_longterm(result, earnings=None):
+    """中長期分析：重要事項を先に示し、採点根拠は必要時だけ展開する。"""
     st.subheader("🏢 中長期分析")
+    fundamental = result["fundamental"]
     total_label = (f'{result["score"]} / 100' if result["score"] is not None else "採点保留")
     st.metric("中長期適性", result["grade"], total_label)
     st.write(f'**判定**　{result["grade_text"]}')
-    fundamental = result["fundamental"]
-    earnings_label = (f'{result["earnings_score"]}点' if result["earnings_score"] is not None
-                      else "採点保留")
-    st.write(f'**点数内訳**　業績・会社予想 {earnings_label}（70点）｜　'
-             f'長期チャート {result["chart_score"]}点（30点）')
-    # 採点の根拠は折りたたまず常時表示する。中長期点の検証に必要。
-    st.markdown("**業績点の計算内訳**")
-    if fundamental["components"]:
-        for item in fundamental["components"]:
-            st.write(f'{item["label"]}：{item["score"]} / {item["max"]}点 — {item["explanation"]}')
-        raw_points = sum(item["score"] for item in fundamental["components"])
-        available_points = fundamental["coverage"]
-        if fundamental["score"] is not None:
-            if available_points < 70:
-                st.caption(f'採点可能な項目 {raw_points}/{available_points}点を70点満点に換算 → 業績 {fundamental["score"]}点（暫定）')
-            else:
-                st.caption(f'4項目合計 {raw_points}/70点 → 業績 {fundamental["score"]}点')
-    else:
-        st.caption("採点できる業績データがありません。")
-    for note in fundamental.get("notes", []):
-        st.caption(f"・{note}")
+
+    earnings_label = (f'{result["earnings_score"]} / 70点'
+                      if result["earnings_score"] is not None else "採点保留")
+    st.write(f'**業績・会社予想**　{earnings_label}　｜　'
+             f'**長期チャート**　{result["chart_score"]} / 30点')
+
+    # 冒頭は重要な事実だけ。数値は採点時と同じデータから抽出し、再計算しない。
+    components = fundamental.get("components", [])
+    for item in components:
+        if item["label"] in ("前年同期の実績", "通期会社予想と前期実績"):
+            st.write(f'**{item["label"]}**　{item["explanation"]}')
+
+    # 残り期間に必要な利益は採点外だが、会社予想を読むうえで重要なので先頭に表示。
+    notes = fundamental.get("notes", [])
+    required_note = next((note for note in notes
+                          if note.startswith("通期予想達成に残り期間で必要な営業利益：")), None)
+    comparison_note = next((note for note in notes
+                            if note.startswith("残り期間に必要な営業利益の前年同期比：")), None)
+    if required_note:
+        st.info(f"**会社予想の確認ポイント**\n\n{required_note}"
+                + (f"\n\n{comparison_note}" if comparison_note else ""))
+    st.write(f'**長期チャート**　{result["chart_label"]}　｜　'
+             f'約1年騰落率 {result["return240"]:+.1f}%')
+
     if fundamental["provisional"] and fundamental["score"] is not None:
-        st.warning(f'業績資料の充足度 {fundamental["coverage"]}/70点分：欠損項目を除いた暫定点です。')
+        st.warning(f'業績の一部資料が不足しています（採点可能 {fundamental["coverage"]}/70点分）。'
+                   '表示点は暫定値です。')
     elif fundamental["score"] is None:
         st.warning("業績資料不足のため、総合点・ランクは表示していません。")
-    st.write(f'**長期チャート**　{result["chart_label"]}')
-    st.write(f'**6か月騰落率**　{result["return120"]:+.1f}%　｜　**約1年騰落率**　{result["return240"]:+.1f}%')
-    # 古いセッション結果やデータ欠損でも nan を表示しない。
-    def longterm_display(value, suffix="", digits=1):
-        try:
-            number = float(value)
-            return f"{number:.{digits}f}{suffix}" if np.isfinite(number) else "データ不足"
-        except (TypeError, ValueError):
-            return "データ不足"
 
-    position = result.get("range_position")
-    position_text = longterm_display(float(position) * 100, "%", 0) if position is not None else "データ不足"
-    st.write(
-        f'**約1年の位置**　{position_text}　｜　'
-        f'高値 {longterm_display(result.get("high252"), " 円")}　｜　'
-        f'安値 {longterm_display(result.get("low252"), " 円")}'
-    )
-    if position_text == "データ不足":
-        st.caption("高値・安値の有効なデータが不足しているため、年間位置の評価は採点対象外です。")
-    st.write(f'**移動平均線**　50日線 {result["ma50"]:.1f}　｜　200日線 {result["ma200"]:.1f}')
+    with st.expander("採点の根拠・業績データを詳しく見る"):
+        st.markdown("**業績点の計算内訳**")
+        if components:
+            for item in components:
+                st.write(f'{item["label"]}：{item["score"]} / {item["max"]}点 — {item["explanation"]}')
+            raw_points = sum(item["score"] for item in components)
+            coverage = fundamental["coverage"]
+            if fundamental["score"] is not None:
+                if coverage < 70:
+                    st.caption(f'採点可能な項目 {raw_points}/{coverage}点を70点満点に換算 → '
+                               f'業績 {fundamental["score"]}点（暫定）')
+                else:
+                    st.caption(f'4項目合計 {raw_points}/70点 → 業績 {fundamental["score"]}点')
+        else:
+            st.caption("採点できる業績データがありません。")
 
-    with st.expander("業績・会社予想の確認"):
-        for item in fundamental["components"]:
-            st.write(f'{item["label"]}：{item["score"]}/{item["max"]}点 — {item["explanation"]}')
-        for reason in fundamental["reasons"]:
+        st.markdown("**会社予想・進捗の補足**")
+        for note in notes:
+            st.caption(f"・{note}")
+        for reason in fundamental.get("reasons", []):
             st.caption(reason)
+
+        st.markdown("**長期チャートの数値**")
+        st.write(f'6か月騰落率 {result["return120"]:+.1f}%　｜　'
+                 f'約1年騰落率 {result["return240"]:+.1f}%')
+
+        # 古いセッション結果やデータ欠損でも nan を表示しない。
+        def longterm_display(value, suffix="", digits=1):
+            try:
+                number = float(value)
+                return f"{number:.{digits}f}{suffix}" if np.isfinite(number) else "データ不足"
+            except (TypeError, ValueError):
+                return "データ不足"
+
+        position = result.get("range_position")
+        position_text = (longterm_display(float(position) * 100, "%", 0)
+                         if position is not None else "データ不足")
+        st.write(f'約1年の位置 {position_text}　｜　'
+                 f'高値 {longterm_display(result.get("high252"), " 円")}　｜　'
+                 f'安値 {longterm_display(result.get("low252"), " 円")}')
+        if position_text == "データ不足":
+            st.caption("年間高値・安値の有効データが不足しているため、年間位置は採点対象外です。")
+        st.write(f'移動平均線：50日線 {longterm_display(result.get("ma50"))}　｜　'
+                 f'200日線 {longterm_display(result.get("ma200"))}')
         show_earnings_summary(earnings)
 
-    st.caption("中長期適性は独自の簡易参考指標（業績70点・長期チャート30点）です。実績と会社予想を別項目で採点し、予想の実現や投資成果を保証しません。予想達成に必要な残り期間の利益は参考表示であり、達成可能性の確率や採点には使用していません。")
+    st.caption("独自の簡易参考指標（業績70点・チャート30点）。会社予想は実績ではなく、"
+               "必要利益の比較は達成確率や採点には使用しません。投資成果を保証するものではありません。")
 
 
 def show_swing(result, earnings=None):
