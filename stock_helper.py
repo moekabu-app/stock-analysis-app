@@ -446,115 +446,67 @@ def show_morning_market_brief():
     st.write(f'**為替**　{brief["fx"]}')
 
 
-def download_intraday_data(code):
-    """直近5営業日の5分足を取得する。取得不能でも日足分析は継続する。"""
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_intraday_daytrade_adjustment(code):
+    """直近の5分足を、画面を増やさずデイトレ適性へ反映する。"""
     try:
         data = yf.download(
             f"{code}.T",
-            period="5d",
+            period="60d",
             interval="5m",
             auto_adjust=False,
             progress=False,
             prepost=False,
-            timeout=15,
+            timeout=30,
         )
+        if data is None or data.empty:
+            return 0
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        data = data[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+        if data.index.tz is not None:
+            data.index = data.index.tz_convert("Asia/Tokyo")
+
+        opening_ranges = []
+        opening_turnovers = []
+        for _, session in data.groupby(data.index.date):
+            opening = session.between_time("09:00", "09:29")
+            if len(opening) < 4:
+                continue
+            open_price = float(opening["Open"].iloc[0])
+            if open_price <= 0:
+                continue
+            opening_ranges.append(
+                (float(opening["High"].max()) - float(opening["Low"].min()))
+                / open_price * 100
+            )
+            opening_turnovers.append(
+                float((opening["Close"] * opening["Volume"]).sum()) / 100_000_000
+            )
+
+        if len(opening_ranges) < 10:
+            return 0
+
+        range_average = float(np.mean(opening_ranges))
+        turnover_average = float(np.mean(opening_turnovers))
+        adjustment = 0
+        if range_average >= 2.0:
+            adjustment += 4
+        elif range_average >= 1.2:
+            adjustment += 2
+        elif range_average < 0.5:
+            adjustment -= 3
+
+        if turnover_average >= 10:
+            adjustment += 4
+        elif turnover_average >= 3:
+            adjustment += 2
+        elif turnover_average < 0.5:
+            adjustment -= 3
+
+        return adjustment
     except Exception:
-        return None
-
-    if data is None or data.empty:
-        return None
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    if any(col not in data.columns for col in required):
-        return None
-
-    data = data[required].dropna().copy()
-    return data if len(data) >= 26 else None
-
-
-def analyze_intraday_entry(data, daytrade):
-    """前日高値・安値に対する5分足の抜けと維持を簡易判定する。"""
-    if data is None or len(data) < 26:
-        return {"available": False}
-
-    df = data.copy()
-    df["MA5"] = df["Close"].rolling(5).mean()
-    df["MA25"] = df["Close"].rolling(25).mean()
-    df["Volume20"] = df["Volume"].rolling(20).mean()
-    latest = df.iloc[-1]
-    recent = df.iloc[-3:]
-
-    price = float(latest["Close"])
-    ma5 = float(latest["MA5"])
-    ma25 = float(latest["MA25"])
-    volume_ratio = float(latest["Volume"] / latest["Volume20"]) if latest["Volume20"] > 0 else 0
-    recent_low = float(recent["Low"].min())
-    recent_high = float(recent["High"].max())
-    prev_high = float(daytrade["prev_high"])
-    prev_low = float(daytrade["prev_low"])
-    trend_up = ma5 > ma25
-    trend_down = ma5 < ma25
-
-    # 先行判断は、最初の5分足が確定した時点から使う。
-    # 「3本維持」はエントリーを遅らせる条件ではなく、保有継続の確認に分ける。
-    if price > prev_high:
-        early_signal = "ロング候補（初動）"
-        early_detail = "前日高値を上抜けています。実際の板と約定を見て、初動として検討する場面です。"
-    elif price < prev_low:
-        early_signal = "ショート候補（初動）"
-        early_detail = "前日安値を下抜けています。実際の板と約定を見て、初動として検討する場面です。"
-    else:
-        early_signal = "分岐待ち"
-        early_detail = "前日高値・安値の間です。先に抜けた側だけを候補にします。"
-
-    if price > prev_high and recent_low > prev_high:
-        if trend_up and volume_ratio >= 0.8:
-            signal = "ロング優先"
-            detail = "前日高値を上抜けた後、直近3本の5分足で上を維持しています。"
-        else:
-            signal = "上抜け維持・慎重ロング"
-            detail = "前日高値の上を維持中です。5分足の出来高と押し目の浅さを確認します。"
-        level_status = "前日高値を上抜けて維持"
-    elif price < prev_low and recent_high < prev_low:
-        if trend_down and volume_ratio >= 0.8:
-            signal = "ショート優先"
-            detail = "前日安値を下抜けた後、直近3本の5分足で下を維持しています。"
-        else:
-            signal = "下抜け維持・慎重ショート"
-            detail = "前日安値の下を維持中です。5分足の出来高と戻りの弱さを確認します。"
-        level_status = "前日安値を下抜けて維持"
-    elif price > prev_high:
-        signal = "上抜け中・維持待ち"
-        detail = "前日高値は抜けましたが、まだ3本分の維持確認ができていません。"
-        level_status = "前日高値を上抜け"
-    elif price < prev_low:
-        signal = "下抜け中・維持待ち"
-        detail = "前日安値は割れましたが、まだ3本分の維持確認ができていません。"
-        level_status = "前日安値を下抜け"
-    else:
-        signal = "見送り・分岐待ち"
-        detail = "前日高値・安値の間です。どちらかを抜け、5分足で維持するまで待ちます。"
-        level_status = "前日レンジ内"
-
-    timestamp = data.index[-1]
-    time_label = timestamp.strftime("%m/%d %H:%M")
-    return {
-        "available": True,
-        "early_signal": early_signal,
-        "early_detail": early_detail,
-        "signal": signal,
-        "detail": detail,
-        "level_status": level_status,
-        "price": price,
-        "time_label": time_label,
-        "ma_direction": "上向き" if trend_up else "下向き" if trend_down else "横ばい",
-        "volume_ratio": volume_ratio,
-        "prev_high": prev_high,
-        "prev_low": prev_low,
-    }
+        return 0
 
 
 def calculate_atr(data, period=14):
@@ -579,7 +531,7 @@ def calculate_atr(data, period=14):
 # =========================================================
 # デイトレ簡易分析
 # =========================================================
-def analyze_daytrade(data):
+def analyze_daytrade(data, intraday_adjustment=0):
     df = data.copy()
 
     df["MA5"] = df["Close"].rolling(5).mean()
@@ -705,7 +657,9 @@ def analyze_daytrade(data):
         + volume_score
         + trend_score
         + position_score
+        + intraday_adjustment
     )
+    total = max(0, min(100, total))
 
     if total >= 85:
         grade = "A"
@@ -2392,7 +2346,11 @@ if mode == "気になる銘柄を調べる":
 
                     if "daytrade" in selected_styles:
                         result["outlook"] = run_stock_outlook(code)
-                        result["daytrade"] = analyze_daytrade(data)
+                        intraday_adjustment = get_intraday_daytrade_adjustment(code)
+                        result["daytrade"] = analyze_daytrade(
+                            data,
+                            intraday_adjustment=intraday_adjustment,
+                        )
 
                     if "swing" in selected_styles:
                         result["swing"] = analyze_swing(data)
