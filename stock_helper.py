@@ -58,7 +58,7 @@ def require_cloud_login():
         st.title("🔒 カブグルマン★★★")
         st.write("利用を許可された方専用です。")
         entered_passcode = st.text_input("合言葉", type="password") or ""
-        if st.button("入る"):
+        if st.button("enter"):
             if hmac.compare_digest(
                 str(entered_passcode).encode("utf-8"),
                 expected_passcode.encode("utf-8"),
@@ -2274,8 +2274,8 @@ def show_swing(result, earnings=None):
 # メイン画面
 # =========================================================
 st.markdown(
-    '<div style="font-size:1.45rem; font-weight:700; white-space:nowrap; '
-    'line-height:1.25;">カブグルマン★★★</div>',
+    '<p style="font-size:1.2rem; font-weight:700; margin:0 0 0.5rem 0; '
+    'white-space:nowrap;">カブグルマン★★★</p>',
     unsafe_allow_html=True,
 )
 show_morning_market_brief()
