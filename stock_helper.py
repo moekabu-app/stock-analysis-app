@@ -2382,6 +2382,20 @@ def show_longterm(result, earnings=None):
                       else "採点保留")
     st.write(f'**点数内訳**　業績・会社予想 {earnings_label}（70点）｜　'
              f'長期チャート {result["chart_score"]}点（30点）')
+    # 採点の根拠は折りたたまず常時表示する。中長期点の検証に必要。
+    st.markdown("**業績点の計算内訳**")
+    if fundamental["components"]:
+        for item in fundamental["components"]:
+            st.write(f'{item["label"]}：{item["score"]} / {item["max"]}点 — {item["explanation"]}')
+        raw_points = sum(item["score"] for item in fundamental["components"])
+        available_points = fundamental["coverage"]
+        if fundamental["score"] is not None:
+            if available_points < 70:
+                st.caption(f'採点可能な項目 {raw_points}/{available_points}点を70点満点に換算 → 業績 {fundamental["score"]}点（暫定）')
+            else:
+                st.caption(f'4項目合計 {raw_points}/70点 → 業績 {fundamental["score"]}点')
+    else:
+        st.caption("採点できる業績データがありません。")
     if fundamental["provisional"] and fundamental["score"] is not None:
         st.warning(f'業績資料の充足度 {fundamental["coverage"]}/70点分：欠損項目を除いた暫定点です。')
     elif fundamental["score"] is None:
