@@ -17,7 +17,7 @@ from email.utils import parsedate_to_datetime
 # ページ設定
 # =========================================================
 st.set_page_config(
-    page_title="銘柄選定お助けマン",
+    page_title="カブグルマン★★★",
     page_icon="🔍",
     layout="centered"
 )
@@ -55,7 +55,7 @@ def require_cloud_login():
                 st.rerun()
             return
 
-        st.title("🔒 銘柄選定お助けマン")
+        st.title("🔒 カブグルマン★★★")
         st.write("利用を許可された方専用です。")
         entered_passcode = st.text_input("合言葉", type="password") or ""
         if st.button("入る"):
@@ -83,7 +83,7 @@ def require_cloud_login():
         st.stop()
 
     if not st.user.is_logged_in:
-        st.title("🔒 銘柄選定お助けマン")
+        st.title("🔒 カブグルマン★★★")
         st.write("このアプリは利用を許可された方専用です。")
         if st.button("Googleでログイン"):
             st.login()
@@ -101,7 +101,7 @@ def require_cloud_login():
     }
 
     if not user_email or user_email not in allowed_emails:
-        st.title("🔒 銘柄選定お助けマン")
+        st.title("🔒 カブグルマン★★★")
         st.error("このGoogleアカウントには利用許可がありません。")
         if st.button("ログアウト"):
             st.logout()
@@ -2079,7 +2079,7 @@ def show_swing(result, earnings=None):
 # =========================================================
 # メイン画面
 # =========================================================
-st.title("🔍 銘柄選定お助けマン")
+st.title("🔍 カブグルマン★★★")
 
 mode = st.radio(
     "何をしますか？",
