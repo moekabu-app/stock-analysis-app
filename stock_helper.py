@@ -988,6 +988,103 @@ def analyze_swing(data):
     }
 
 
+def score_longterm_fundamentals(earnings, price_date=None):
+    """中長期専用：比較可能な業績資料を70点換算。資料欠損は0点扱いしない。"""
+    empty = {"score": None, "coverage": 0, "provisional": True, "components": [],
+             "reasons": ["業績データを取得できないため、業績点は算出しません。"]}
+    if not isinstance(earnings, dict) or not earnings.get("ok"):
+        return empty
+
+    try:
+        disclosure = pd.Timestamp(earnings.get("disclosure_date"))
+        price = pd.Timestamp(price_date)
+        if pd.notna(disclosure) and pd.notna(price) and disclosure.normalize() > price.normalize():
+            return {**empty, "reasons": ["分析対象の株価日より後に公表された決算は使いません。"]}
+    except (TypeError, ValueError):
+        pass
+
+    def num(value):
+        try:
+            n = float(value)
+            return n if np.isfinite(n) else None
+        except (TypeError, ValueError):
+            return None
+
+    components = []
+    def add(label, score, maximum, explanation):
+        components.append({"label": label, "score": score, "max": maximum,
+                           "explanation": explanation})
+
+    # 会社予想の同一年度内の初回→最新比較（20点）。履歴のない銘柄は採点対象外。
+    history = earnings.get("forecast_history")
+    if history:
+        judgment = history.get("overall_judgment")
+        scores = {"上方修正": 20, "予想維持": 10, "下方修正": 0,
+                  "EPSのみ上方修正": 13, "EPSのみ下方修正": 7}
+        if judgment in scores:
+            add("会社予想の修正", scores[judgment], 20, f"初回から最新：{judgment}")
+        elif judgment == "混合修正":
+            first = num((history.get("first") or {}).get("forecast_operating_income"))
+            latest = num((history.get("latest") or {}).get("forecast_operating_income"))
+            if first is not None and latest is not None:
+                points = 14 if latest > first else 6 if latest < first else 10
+                add("会社予想の修正", points, 20, "混合修正：営業利益の方向を優先")
+
+    # 同一四半期の前年実績を比較（25点）。赤字・黒字の変化を先に扱う。
+    previous = earnings.get("year_ago") or {}
+    revenue, op = num(earnings.get("revenue")), num(earnings.get("operating_income"))
+    prev_rev, prev_op = num(previous.get("revenue")), num(previous.get("operating_income"))
+    if op is not None and prev_op is not None:
+        if prev_op <= 0 < op:
+            pts, desc = 25, "営業利益が黒字転換"
+        elif prev_op >= 0 > op:
+            pts, desc = 0, "営業利益が赤字転落"
+        elif prev_op < 0 and op < 0:
+            pts, desc = (12 if op > prev_op else 0), "営業赤字の縮小・拡大"
+        elif prev_op > 0:
+            op_rate = (op - prev_op) / prev_op * 100
+            rev_rate = ((revenue - prev_rev) / abs(prev_rev) * 100
+                        if revenue is not None and prev_rev not in (None, 0) else None)
+            pts = (20 if op_rate >= 20 else 16 if op_rate >= 10 else 12
+                   if op_rate >= 0 else 7 if op_rate > -20 else 0)
+            if rev_rate is not None:
+                pts = max(0, min(25, pts + (5 if rev_rate >= 10 else -5 if rev_rate <= -10 else 0)))
+            desc = f"営業利益前年比 {op_rate:+.1f}%" + (
+                f"、売上前年比 {rev_rate:+.1f}%" if rev_rate is not None else "（売上前年比不明）")
+        else:
+            pts, desc = (12 if op == 0 else 0), "前年・当年の営業利益がゼロ付近"
+        add("前年同四半期の業績", pts, 25, desc)
+
+    # 営業利益率の水準（15点）：同じ会計期間の売上・営業利益を使用。
+    if revenue is not None and revenue > 0 and op is not None:
+        margin = op / revenue * 100
+        pts = (15 if margin >= 15 else 12 if margin >= 10 else 9
+               if margin >= 5 else 5 if margin >= 0 else 0)
+        add("営業利益率の水準", pts, 15, f"直近決算の営業利益率 {margin:.1f}%")
+
+    # 初回→最新の予想営業利益率差（10点）。比較不能なら分母から除外。
+    if history:
+        before, after = num(history.get("first_operating_margin")), num(history.get("latest_operating_margin"))
+        if before is not None and after is not None:
+            delta = after - before
+            pts = (10 if delta >= 2 else 7 if delta >= 0.5 else 5
+                   if delta > -0.5 else 3 if delta > -2 else 0)
+            add("予想営業利益率の変化", pts, 10, f"初回比 {delta:+.2f}ポイント")
+
+    maximum = sum(item["max"] for item in components)
+    # 40点分以上の根拠がなければ数字を出さない。未取得を中立点とみなさない。
+    if maximum < 40:
+        return {"score": None, "coverage": maximum, "provisional": True,
+                "components": components,
+                "reasons": ["比較可能な業績指標が40/70点分に満たないため採点保留。"]}
+    raw = sum(item["score"] for item in components)
+    scaled = int(raw / maximum * 70 + 0.5)
+    return {"score": scaled, "coverage": maximum,
+            "provisional": maximum < 70, "components": components,
+            "reasons": ["欠損項目を除き、採点可能な項目を70点満点へ換算。" if maximum < 70
+                        else "4項目を合計して70点満点で採点。"]}
+
+
 # =========================================================
 # 中長期分析
 # =========================================================
@@ -1041,16 +1138,16 @@ def analyze_longterm(data, earnings=None):
     else:
         chart_label = "長期は転換・調整局面"
 
-    earnings_adjustment = calculate_earnings_adjustment(
-        earnings,
-        pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d"),
+    # 中長期専用の業績採点。スイング向けの決算鮮度補正は使わない。
+    fundamental = score_longterm_fundamentals(
+        earnings, pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d")
     )
-    # 決算・会社予想を最大70点へ換算する。基準点50点に、
-    # 上方・下方修正、前年同期比、利益率変化を強めに反映する。
-    earnings_score = max(0, min(70, 50 + earnings_adjustment["total"] * 1.7))
-    total = int(max(0, min(100, chart_score + earnings_score)))
+    earnings_score = fundamental["score"]
+    total = min(100, chart_score + earnings_score) if earnings_score is not None else None
 
-    if total >= 75:
+    if total is None:
+        grade, grade_text = "—", "業績資料不足のため採点保留"
+    elif total >= 75:
         grade, grade_text = "A", "中長期の保有候補として良好"
     elif total >= 60:
         grade, grade_text = "B", "中長期で検討しやすい"
@@ -1064,7 +1161,8 @@ def analyze_longterm(data, earnings=None):
         "grade": grade,
         "grade_text": grade_text,
         "chart_score": chart_score,
-        "earnings_score": int(earnings_score),
+        "earnings_score": earnings_score,
+        "fundamental": fundamental,
         "chart_label": chart_label,
         "return120": return120,
         "return240": return240,
@@ -1073,7 +1171,7 @@ def analyze_longterm(data, earnings=None):
         "ma200": ma200,
         "high252": high252,
         "low252": low252,
-        "earnings_adjustment": earnings_adjustment,
+        "earnings_adjustment": fundamental,
     }
 
 
@@ -2276,16 +2374,18 @@ def show_daytrade(result):
 
 def show_longterm(result, earnings=None):
     st.subheader("🏢 中長期分析")
-    st.metric(
-        "中長期適性",
-        result["grade"],
-        f'{result["score"]} / 100',
-    )
+    total_label = (f'{result["score"]} / 100' if result["score"] is not None else "採点保留")
+    st.metric("中長期適性", result["grade"], total_label)
     st.write(f'**判定**　{result["grade_text"]}')
-    st.write(
-        f'**点数内訳**　業績・会社予想 {result["earnings_score"]}点（70点）｜　'
-        f'長期チャート {result["chart_score"]}点（30点）'
-    )
+    fundamental = result["fundamental"]
+    earnings_label = (f'{result["earnings_score"]}点' if result["earnings_score"] is not None
+                      else "採点保留")
+    st.write(f'**点数内訳**　業績・会社予想 {earnings_label}（70点）｜　'
+             f'長期チャート {result["chart_score"]}点（30点）')
+    if fundamental["provisional"] and fundamental["score"] is not None:
+        st.warning(f'業績資料の充足度 {fundamental["coverage"]}/70点分：欠損項目を除いた暫定点です。')
+    elif fundamental["score"] is None:
+        st.warning("業績資料不足のため、総合点・ランクは表示していません。")
     st.write(f'**長期チャート**　{result["chart_label"]}')
     st.write(f'**6か月騰落率**　{result["return120"]:+.1f}%　｜　**約1年騰落率**　{result["return240"]:+.1f}%')
     # 古いセッション結果やデータ欠損でも nan を表示しない。
@@ -2308,12 +2408,13 @@ def show_longterm(result, earnings=None):
     st.write(f'**移動平均線**　50日線 {result["ma50"]:.1f}　｜　200日線 {result["ma200"]:.1f}')
 
     with st.expander("業績・会社予想の確認"):
-        adjustment = result["earnings_adjustment"]
-        for reason in adjustment["reasons"]:
-            st.write(f"・{reason}")
+        for item in fundamental["components"]:
+            st.write(f'{item["label"]}：{item["score"]}/{item["max"]}点 — {item["explanation"]}')
+        for reason in fundamental["reasons"]:
+            st.caption(reason)
         show_earnings_summary(earnings)
 
-    st.caption("中長期適性は、長期チャートと直近決算・会社予想の簡易評価による参考指標です。")
+    st.caption("中長期適性は、業績70点・長期チャート30点の参考指標です。業績の点数は独立した中長期用基準で算定し、決算発表からの日数では減衰しません。")
 
 
 def show_swing(result, earnings=None):
