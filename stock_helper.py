@@ -1590,6 +1590,74 @@ def build_annual_trend(result):
     return {"rows": rows, "warnings": warnings}
 
 
+
+def analyze_annual_growth(trend):
+    """通期実績だけから変化量を計算する。欠損・会計区分不明は推測補完しない。"""
+    rows = (trend or {}).get("rows") or []
+    clean = []
+    for row in rows:
+        try:
+            year = int(str(row.get("年度"))[:4])
+        except (ValueError, TypeError):
+            continue
+        clean.append((year, row))
+    clean.sort(key=lambda item: item[0])
+    # 年度の重複があれば曖昧な比較を避ける。
+    if len({year for year, _ in clean}) != len(clean):
+        return {"lines": [], "notes": ["年度が重複しているため、成長指標は計算していません。"]}
+    if len(clean) < 2:
+        return {"lines": [], "notes": ["通期実績が2年度以上必要です。"]}
+
+    def value(row, key):
+        try:
+            v = float(row.get(key))
+            return v if np.isfinite(v) else None
+        except (ValueError, TypeError):
+            return None
+
+    previous_year, previous = clean[-2]
+    latest_year, latest = clean[-1]
+    lines = []
+    notes = []
+    if latest_year == previous_year + 1:
+        for label, key in (("売上高", "売上高（億円）"), ("営業利益", "営業利益（億円）")):
+            old, current = value(previous, key), value(latest, key)
+            if old is not None and old > 0 and current is not None:
+                lines.append(f"直近の{label}：{previous_year}年度比 {((current / old) - 1) * 100:+.1f}%")
+            elif old is not None and old <= 0 and current is not None:
+                notes.append(f"{label}の直近増減率は前年値がゼロ以下のため算出していません。")
+        old_margin = value(previous, "営業利益率（%）")
+        current_margin = value(latest, "営業利益率（%）")
+        if old_margin is not None and current_margin is not None:
+            lines.append(f"直近の営業利益率：{old_margin:.1f}% → {current_margin:.1f}%（{current_margin - old_margin:+.1f}ポイント）")
+    else:
+        notes.append("最新2年度が連続していないため、直近の前年比は表示していません。")
+
+    earliest_year, earliest = clean[0]
+    intervals = latest_year - earliest_year
+    years_contiguous = intervals == len(clean) - 1
+    if years_contiguous and intervals > 0:
+        old_rev = value(earliest, "売上高（億円）")
+        new_rev = value(latest, "売上高（億円）")
+        if old_rev is not None and old_rev > 0 and new_rev is not None and new_rev >= 0:
+            cagr = ((new_rev / old_rev) ** (1 / intervals) - 1) * 100
+            lines.append(f"売上高の年平均増減率：{cagr:+.1f}%（{earliest_year}〜{latest_year}年度、{intervals}年間）")
+        else:
+            notes.append("売上高の年平均増減率は有効な開始・終了値がないため算出していません。")
+    else:
+        notes.append("年度に欠けがあるため、売上高の年平均増減率は算出していません。")
+
+    margins = [(year, value(row, "営業利益率（%）")) for year, row in clean]
+    margins = [(year, margin) for year, margin in margins if margin is not None]
+    if len(margins) >= 2:
+        first_year, first_margin = margins[0]
+        last_year, last_margin = margins[-1]
+        lines.append(f"期間初と最新の営業利益率：{first_margin:.1f}% → {last_margin:.1f}%（{last_margin - first_margin:+.1f}ポイント）")
+    notes.append("年次実績の変化を示す参考情報です。中長期37点など既存の採点には反映していません。")
+    notes.append("年平均増減率は年度間の複利換算であり、将来の成長率の予測ではありません。")
+    return {"lines": lines, "notes": notes}
+
+
 def fetch_annual_trend(edinet_code, api_key):
     """既存の決算取得と同じ API キー・企業コードで年次実績のみ追加取得。"""
     response, error = edinet_request_json(
@@ -2574,6 +2642,12 @@ def show_longterm(result, earnings=None):
         if trend.get("rows"):
             st.dataframe(pd.DataFrame(trend["rows"]), hide_index=True, use_container_width=True)
             st.caption("金額は億円。通期の確定実績のみで、会社予想や四半期累計は含みません。")
+            growth = analyze_annual_growth(trend)
+            st.markdown("**長期の売上・利益・収益性の変化（採点対象外）**")
+            for line in growth["lines"]:
+                st.write("・" + line)
+            for note in growth["notes"]:
+                st.caption("・" + note)
         else:
             st.caption("過去5年間の通期実績は取得できませんでした。")
         for warning in trend.get("warnings", []):
