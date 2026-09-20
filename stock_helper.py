@@ -989,6 +989,88 @@ def analyze_swing(data):
 
 
 # =========================================================
+# 中長期分析
+# =========================================================
+def analyze_longterm(data, earnings=None):
+    """業績と約1年の株価位置から、中長期の保有候補としての強さを見る。"""
+    df = data.copy()
+    df["MA50"] = df["Close"].rolling(50).mean()
+    df["MA200"] = df["Close"].rolling(200).mean()
+    df["High252"] = df["High"].rolling(252).max()
+    df["Low252"] = df["Low"].rolling(252).min()
+
+    latest = df.iloc[-1]
+    close = float(latest["Close"])
+    ma50 = float(latest["MA50"])
+    ma200 = float(latest["MA200"])
+    high252 = float(latest["High252"])
+    low252 = float(latest["Low252"])
+
+    return120 = (close / float(df["Close"].iloc[-121]) - 1) * 100 if len(df) >= 121 else 0
+    return240 = (close / float(df["Close"].iloc[-241]) - 1) * 100 if len(df) >= 241 else 0
+    range_position = (close - low252) / (high252 - low252) if high252 > low252 else 0.5
+
+    # テクニカルは最大30点。中長期では、業績の補助確認として扱う。
+    chart_score = 0
+    if close > ma200:
+        chart_score += 10
+    if ma50 > ma200:
+        chart_score += 8
+    if return240 > 0:
+        chart_score += 6
+    elif return240 > -10:
+        chart_score += 3
+    if 0.30 <= range_position <= 0.85:
+        chart_score += 6
+    elif range_position > 0.85:
+        chart_score += 4
+    else:
+        chart_score += 2
+
+    if close > ma200 and ma50 > ma200:
+        chart_label = "長期上昇基調"
+    elif close < ma200 and ma50 < ma200:
+        chart_label = "長期下降基調"
+    else:
+        chart_label = "長期は転換・調整局面"
+
+    earnings_adjustment = calculate_earnings_adjustment(
+        earnings,
+        pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d"),
+    )
+    # 決算・会社予想を最大70点へ換算する。基準点50点に、
+    # 上方・下方修正、前年同期比、利益率変化を強めに反映する。
+    earnings_score = max(0, min(70, 50 + earnings_adjustment["total"] * 1.7))
+    total = int(max(0, min(100, chart_score + earnings_score)))
+
+    if total >= 75:
+        grade, grade_text = "A", "中長期の保有候補として良好"
+    elif total >= 60:
+        grade, grade_text = "B", "中長期で検討しやすい"
+    elif total >= 45:
+        grade, grade_text = "C", "業績・株価の確認を続けたい"
+    else:
+        grade, grade_text = "D", "現時点では優先度低め"
+
+    return {
+        "score": total,
+        "grade": grade,
+        "grade_text": grade_text,
+        "chart_score": chart_score,
+        "earnings_score": int(earnings_score),
+        "chart_label": chart_label,
+        "return120": return120,
+        "return240": return240,
+        "range_position": range_position,
+        "ma50": ma50,
+        "ma200": ma200,
+        "high252": high252,
+        "low252": low252,
+        "earnings_adjustment": earnings_adjustment,
+    }
+
+
+# =========================================================
 # EDINET DB 決算データ
 # =========================================================
 EDINETDB_BASE_URL = "https://edinetdb.jp/v1"
@@ -2185,6 +2267,35 @@ def show_daytrade(result):
     )
 
 
+def show_longterm(result, earnings=None):
+    st.subheader("🏢 中長期分析")
+    st.metric(
+        "中長期適性",
+        result["grade"],
+        f'{result["score"]} / 100',
+    )
+    st.write(f'**判定**　{result["grade_text"]}')
+    st.write(
+        f'**点数内訳**　業績・会社予想 {result["earnings_score"]}点（70点）｜　'
+        f'長期チャート {result["chart_score"]}点（30点）'
+    )
+    st.write(f'**長期チャート**　{result["chart_label"]}')
+    st.write(f'**6か月騰落率**　{result["return120"]:+.1f}%　｜　**約1年騰落率**　{result["return240"]:+.1f}%')
+    st.write(
+        f'**約1年の位置**　{result["range_position"] * 100:.0f}%　｜　'
+        f'高値 {result["high252"]:.1f} 円　｜　安値 {result["low252"]:.1f} 円'
+    )
+    st.write(f'**移動平均線**　50日線 {result["ma50"]:.1f}　｜　200日線 {result["ma200"]:.1f}')
+
+    with st.expander("業績・会社予想の確認"):
+        adjustment = result["earnings_adjustment"]
+        for reason in adjustment["reasons"]:
+            st.write(f"・{reason}")
+        show_earnings_summary(earnings)
+
+    st.caption("中長期適性は、長期チャートと直近決算・会社予想の簡易評価による参考指標です。")
+
+
 def show_swing(result, earnings=None):
     st.subheader("📊 スイング分析")
 
@@ -2347,6 +2458,9 @@ if mode == "気になる銘柄を調べる":
                     company = get_company_name(ticker)
 
                     result = {}
+                    earnings = None
+                    if "swing" in selected_styles or "longterm" in selected_styles:
+                        earnings = fetch_earnings_summary(code)
 
                     if "daytrade" in selected_styles:
                         result["outlook"] = run_stock_outlook(code)
@@ -2358,10 +2472,11 @@ if mode == "気になる銘柄を調べる":
 
                     if "swing" in selected_styles:
                         result["swing"] = analyze_swing(data)
-                        result["swing_earnings"] = fetch_earnings_summary(code)
+                        result["swing_earnings"] = earnings
 
                     if "longterm" in selected_styles:
-                        result["longterm"] = None
+                        result["longterm"] = analyze_longterm(data, earnings)
+                        result["longterm_earnings"] = earnings
 
                     st.session_state.helper_result = result
                     st.session_state.helper_code = code
@@ -2405,10 +2520,9 @@ if mode == "気になる銘柄を調べる":
 
         if "longterm" in result:
             st.divider()
-            st.subheader("🏢 中長期分析")
-            st.info(
-                "業績・財務・長期チャート・目標株価・"
-                "企業行動パターンなどを順番に実装します。"
+            show_longterm(
+                result["longterm"],
+                result.get("longterm_earnings"),
             )
 
         st.divider()
