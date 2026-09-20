@@ -2498,11 +2498,19 @@ def show_longterm(result, earnings=None):
         else:
             st.caption("採点できる業績データがありません。")
 
-        st.markdown("**会社予想・進捗の補足**")
-        for note in notes:
-            st.caption(f"・{note}")
-        for reason in fundamental.get("reasons", []):
-            st.caption(reason)
+        # 冒頭に表示した必要利益・必要増益率は詳細欄では繰り返さない。
+        supplemental_notes = [
+            note for note in notes
+            if not note.startswith((
+                "通期予想達成に残り期間で必要な営業利益：",
+                "残り期間に必要な営業利益の前年同期比：",
+            ))
+            and note != "会社予想は未達の可能性があり、実績とは区別して表示しています。"
+        ]
+        if supplemental_notes:
+            st.markdown("**会社予想・進捗の補足**")
+            for note in supplemental_notes:
+                st.caption(f"・{note}")
 
         st.markdown("**長期チャートの数値**")
         st.write(f'6か月騰落率 {result["return120"]:+.1f}%　｜　'
@@ -2526,10 +2534,9 @@ def show_longterm(result, earnings=None):
             st.caption("年間高値・安値の有効データが不足しているため、年間位置は採点対象外です。")
         st.write(f'移動平均線：50日線 {longterm_display(result.get("ma50"))}　｜　'
                  f'200日線 {longterm_display(result.get("ma200"))}')
-        show_earnings_summary(earnings)
 
-    st.caption("独自の簡易参考指標（業績70点・チャート30点）。会社予想と実績は区別し、"
-               "必要利益の比較は達成確率や採点には使用しません。")
+    st.caption("中長期専用の参考指標（業績70点・チャート30点）。会社予想は実績と区別し、"
+               "必要利益の比較は採点や達成確率に使用しません。")
 
 
 def show_swing(result, earnings=None):
@@ -2608,8 +2615,9 @@ def show_swing(result, earnings=None):
         for comment in result["comments"]:
             st.write(f"・{comment}")
 
-    st.divider()
-    show_earnings_summary(earnings, result.get("data_date"))
+    # 決算の実額と短期用の業績補正は、スイング欄でだけ確認できるようにする。
+    with st.expander("決算データ・スイング用の業績評価を詳しく見る"):
+        show_earnings_summary(earnings, result.get("data_date"))
 
     st.caption(
         "総合点はテクニカル100点に鮮度調整後の業績補正を加え、"
@@ -2760,6 +2768,11 @@ if mode == "気になる銘柄を調べる":
                 result["longterm"],
                 result.get("longterm_earnings"),
             )
+            # スイングも選択した場合は、上のスイング欄にある決算詳細を共用する。
+            # 中長期単独時にも元の決算資料を参照できるようにする。
+            if "swing" not in result:
+                with st.expander("🧾 決算データ・短期用の業績評価を見る（中長期採点とは別）"):
+                    show_earnings_summary(result.get("longterm_earnings"))
 
         st.button(
             "🔄 別の銘柄を調べる",
@@ -2775,7 +2788,4 @@ else:
     )
 
 
-st.caption(
-    "分析結果は売買を保証するものではなく、"
-    "投資判断の参考情報として表示しています。"
-)
+st.caption("分析は参考情報であり、投資成果を保証しません。")
