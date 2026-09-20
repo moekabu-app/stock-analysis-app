@@ -996,19 +996,25 @@ def analyze_longterm(data, earnings=None):
     df = data.copy()
     df["MA50"] = df["Close"].rolling(50).mean()
     df["MA200"] = df["Close"].rolling(200).mean()
-    df["High252"] = df["High"].rolling(252).max()
-    df["Low252"] = df["Low"].rolling(252).min()
 
     latest = df.iloc[-1]
     close = float(latest["Close"])
     ma50 = float(latest["MA50"])
     ma200 = float(latest["MA200"])
-    high252 = float(latest["High252"])
-    low252 = float(latest["Low252"])
+    # 取得本数が252営業日にわずかに届かない場合でも、
+    # 取得できた約1年分を使って高値・安値を出す。
+    yearly_data = df.tail(252)
+    # 欠損値や文字列を除外し、有効な高値・安値だけで年間レンジを計算する。
+    yearly_highs = pd.to_numeric(yearly_data["High"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    yearly_lows = pd.to_numeric(yearly_data["Low"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    high252 = float(yearly_highs.max()) if not yearly_highs.empty else float("nan")
+    low252 = float(yearly_lows.min()) if not yearly_lows.empty else float("nan")
 
     return120 = (close / float(df["Close"].iloc[-121]) - 1) * 100 if len(df) >= 121 else 0
     return240 = (close / float(df["Close"].iloc[-241]) - 1) * 100 if len(df) >= 241 else 0
-    range_position = (close - low252) / (high252 - low252) if high252 > low252 else 0.5
+    valid_yearly_range = (np.isfinite(high252) and np.isfinite(low252)
+                          and np.isfinite(close) and high252 > low252)
+    range_position = (close - low252) / (high252 - low252) if valid_yearly_range else float("nan")
 
     # テクニカルは最大30点。中長期では、業績の補助確認として扱う。
     chart_score = 0
@@ -1020,12 +1026,13 @@ def analyze_longterm(data, earnings=None):
         chart_score += 6
     elif return240 > -10:
         chart_score += 3
-    if 0.30 <= range_position <= 0.85:
-        chart_score += 6
-    elif range_position > 0.85:
-        chart_score += 4
-    else:
-        chart_score += 2
+    if valid_yearly_range:
+        if 0.30 <= range_position <= 0.85:
+            chart_score += 6
+        elif range_position > 0.85:
+            chart_score += 4
+        else:
+            chart_score += 2
 
     if close > ma200 and ma50 > ma200:
         chart_label = "長期上昇基調"
@@ -2281,10 +2288,23 @@ def show_longterm(result, earnings=None):
     )
     st.write(f'**長期チャート**　{result["chart_label"]}')
     st.write(f'**6か月騰落率**　{result["return120"]:+.1f}%　｜　**約1年騰落率**　{result["return240"]:+.1f}%')
+    # 古いセッション結果やデータ欠損でも nan を表示しない。
+    def longterm_display(value, suffix="", digits=1):
+        try:
+            number = float(value)
+            return f"{number:.{digits}f}{suffix}" if np.isfinite(number) else "データ不足"
+        except (TypeError, ValueError):
+            return "データ不足"
+
+    position = result.get("range_position")
+    position_text = longterm_display(float(position) * 100, "%", 0) if position is not None else "データ不足"
     st.write(
-        f'**約1年の位置**　{result["range_position"] * 100:.0f}%　｜　'
-        f'高値 {result["high252"]:.1f} 円　｜　安値 {result["low252"]:.1f} 円'
+        f'**約1年の位置**　{position_text}　｜　'
+        f'高値 {longterm_display(result.get("high252"), " 円")}　｜　'
+        f'安値 {longterm_display(result.get("low252"), " 円")}'
     )
+    if position_text == "データ不足":
+        st.caption("高値・安値の有効なデータが不足しているため、年間位置の評価は採点対象外です。")
     st.write(f'**移動平均線**　50日線 {result["ma50"]:.1f}　｜　200日線 {result["ma200"]:.1f}')
 
     with st.expander("業績・会社予想の確認"):
