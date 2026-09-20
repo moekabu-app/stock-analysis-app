@@ -55,7 +55,7 @@ def require_cloud_login():
                 st.rerun()
             return
 
-        st.markdown('<p style="font-size:1.2rem; font-weight:700; white-space:nowrap;">🔒 カブグルマン★★★</p>', unsafe_allow_html=True)
+        st.markdown('<p style="font-size:1.4rem; font-weight:700; white-space:nowrap;">🔒 カブグルマン★★★</p>', unsafe_allow_html=True)
         st.write("利用を許可された方専用です。")
         entered_passcode = st.text_input("合言葉", type="password") or ""
         if st.button("enter"):
@@ -83,7 +83,7 @@ def require_cloud_login():
         st.stop()
 
     if not st.user.is_logged_in:
-        st.markdown('<p style="font-size:1.2rem; font-weight:700; white-space:nowrap;">🔒 カブグルマン★★★</p>', unsafe_allow_html=True)
+        st.markdown('<p style="font-size:1.4rem; font-weight:700; white-space:nowrap;">🔒 カブグルマン★★★</p>', unsafe_allow_html=True)
         st.write("このアプリは利用を許可された方専用です。")
         if st.button("Googleでログイン"):
             st.login()
@@ -101,7 +101,7 @@ def require_cloud_login():
     }
 
     if not user_email or user_email not in allowed_emails:
-        st.markdown('<p style="font-size:1.2rem; font-weight:700; white-space:nowrap;">🔒 カブグルマン★★★</p>', unsafe_allow_html=True)
+        st.markdown('<p style="font-size:1.4rem; font-weight:700; white-space:nowrap;">🔒 カブグルマン★★★</p>', unsafe_allow_html=True)
         st.error("このGoogleアカウントには利用許可がありません。")
         if st.button("ログアウト"):
             st.logout()
@@ -2274,7 +2274,7 @@ def show_swing(result, earnings=None):
 # メイン画面
 # =========================================================
 st.markdown(
-    '<p style="font-size:1.2rem; font-weight:700; margin:0 0 0.5rem 0; '
+    '<p style="font-size:1.4rem; font-weight:700; margin:0 0 0.5rem 0; '
     'white-space:nowrap;">カブグルマン★★★</p>',
     unsafe_allow_html=True,
 )
