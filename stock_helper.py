@@ -2273,7 +2273,11 @@ def show_swing(result, earnings=None):
 # =========================================================
 # メイン画面
 # =========================================================
-st.header("カブグルマン★★★")
+st.markdown(
+    '<div style="font-size:1.45rem; font-weight:700; white-space:nowrap; '
+    'line-height:1.25;">カブグルマン★★★</div>',
+    unsafe_allow_html=True,
+)
 show_morning_market_brief()
 st.divider()
 
