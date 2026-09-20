@@ -230,7 +230,8 @@ def run_stock_outlook(code):
         with tempfile.TemporaryDirectory() as temp_dir:
             completed = subprocess.run(
                 [sys.executable, str(script_path)],
-                input=f"{code}\n",
+                # 最初は銘柄コード、最後は旧プログラムの終了確認用Enter。
+                input=f"{code}\n\n",
                 text=True,
                 capture_output=True,
                 encoding="utf-8",
@@ -1896,13 +1897,10 @@ def show_stock_outlook(result):
                 st.code(result["detail"])
         return
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("方向性", result["direction"])
-    with c2:
-        st.metric("値動き", result["volatility"])
-    with c3:
-        st.metric("信頼度", result["confidence"])
+    # スマホの縦画面でも文言が切れないよう、3列ではなく縦に表示する。
+    st.metric("方向性", result["direction"])
+    st.metric("値動き", result["volatility"])
+    st.metric("信頼度", result["confidence"])
 
     zones = result["zones"]
     up_prices = [
