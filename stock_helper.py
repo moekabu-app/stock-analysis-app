@@ -1100,6 +1100,29 @@ def score_longterm_fundamentals(earnings, price_date=None):
     progress = num(earnings.get("operating_progress"))
     if progress is not None:
         notes.append(f"営業利益の単純進捗率 {progress:+.1f}%（季節性を補正していないため加点・減点なし）")
+
+    # 決算DBの金額単位は百万円。残り期間の必要利益と前年同期間を比較する。
+    # Q4は通期実績のため、残り期間の計算対象にしない。
+    quarter = str(earnings.get("quarter", "")).upper().replace("Q", "")
+    if quarter in ("1", "2", "3") and forecast_op is not None and op is not None:
+        remaining = forecast_op - op
+        notes.append(
+            f"通期予想達成に残り期間で必要な営業利益：{remaining / 100:.1f}億円"
+            f"（通期予想 {forecast_op / 100:.1f}億円 − 累計実績 {op / 100:.1f}億円）"
+        )
+        if annual_op is not None and prev_op is not None:
+            prior_remaining = annual_op - prev_op
+            notes.append(f"前年の同じ残り期間の営業利益：{prior_remaining / 100:.1f}億円")
+            if prior_remaining > 0:
+                required_growth = (remaining / prior_remaining - 1) * 100
+                notes.append(
+                    f"残り期間に必要な営業利益の前年同期比：{required_growth:+.1f}%"
+                    "（達成確率ではなく必要水準の比較。季節性・会社計画の内訳は未反映、採点への加減点なし）"
+                )
+            else:
+                notes.append("前年の残り期間の営業利益がゼロ以下のため、必要増益率は算出しません。")
+        else:
+            notes.append("前年の対応する通期・累計実績が不足しており、残り期間の前年比較はできません。")
     notes.append("会社予想は未達の可能性があり、実績とは区別して表示しています。")
 
     maximum = sum(item["max"] for item in components)
@@ -2478,7 +2501,7 @@ def show_longterm(result, earnings=None):
             st.caption(reason)
         show_earnings_summary(earnings)
 
-    st.caption("中長期適性は独自の簡易参考指標（業績70点・長期チャート30点）です。実績と会社予想を別項目で採点し、予想の実現や投資成果を保証しません。会社予想の達成可能性・前期実績の確認は別途必要です。")
+    st.caption("中長期適性は独自の簡易参考指標（業績70点・長期チャート30点）です。実績と会社予想を別項目で採点し、予想の実現や投資成果を保証しません。予想達成に必要な残り期間の利益は参考表示であり、達成可能性の確率や採点には使用していません。")
 
 
 def show_swing(result, earnings=None):
