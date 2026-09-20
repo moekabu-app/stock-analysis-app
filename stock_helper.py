@@ -245,8 +245,12 @@ def run_stock_outlook(code):
         return {"error": f"株価展望を開始できませんでした：{exc}"}
 
     output = completed.stdout or ""
+    error_output = completed.stderr or ""
     if not output.strip():
-        return {"error": "株価展望の結果を取得できませんでした。"}
+        return {
+            "error": "株価展望エンジンが結果を返せませんでした。",
+            "detail": error_output[-2000:] or "エラー詳細を取得できませんでした。",
+        }
     if "株価データを取得できませんでした" in output:
         return {"error": "株価展望用の株価データを取得できませんでした。"}
 
@@ -1887,6 +1891,9 @@ def show_stock_outlook(result):
 
     if result.get("error"):
         st.warning(result["error"])
+        if result.get("detail"):
+            with st.expander("株価展望のエラー詳細"):
+                st.code(result["detail"])
         return
 
     c1, c2, c3 = st.columns(3)
