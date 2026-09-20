@@ -317,6 +317,247 @@ def download_stock_data(code):
     return data
 
 
+def fetch_market_snapshot(symbol):
+    """寄り前に使う指数の直近騰落率を取得する。"""
+    try:
+        data = yf.download(
+            symbol,
+            period="10d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            timeout=15,
+        )
+        if data is None or data.empty:
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        data = data.dropna(subset=["Close"])
+        if len(data) < 2:
+            return None
+        close = float(data["Close"].iloc[-1])
+        previous = float(data["Close"].iloc[-2])
+        return {"close": close, "change": (close / previous - 1) * 100}
+    except Exception:
+        return None
+
+
+def fetch_nikkei_futures():
+    try:
+        data = yf.download(
+            "NKD=F",
+            period="5d",
+            interval="1h",
+            auto_adjust=False,
+            progress=False,
+            timeout=15,
+        )
+        if data is None or data.empty:
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        data = data.dropna(subset=["Close"])
+        return float(data["Close"].iloc[-1]) if not data.empty else None
+    except Exception:
+        return None
+
+
+def morning_score(change):
+    if change is None or pd.isna(change):
+        return 0
+    if change >= 1.0:
+        return 2
+    if change >= 0.30:
+        return 1
+    if change <= -1.0:
+        return -2
+    if change <= -0.30:
+        return -1
+    return 0
+
+
+def morning_label(score):
+    if score >= 2:
+        return "強い追い風"
+    if score == 1:
+        return "追い風"
+    if score <= -2:
+        return "強い逆風"
+    if score == -1:
+        return "逆風"
+    return "中立"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_morning_market_brief():
+    """8:55に一画面で見るための、寄り前地合い要約。"""
+    nikkei = fetch_market_snapshot("^N225")
+    nasdaq = fetch_market_snapshot("^IXIC")
+    sox = fetch_market_snapshot("^SOX")
+    usd_jpy = fetch_market_snapshot("JPY=X")
+    futures = fetch_nikkei_futures()
+
+    futures_gap = None
+    if nikkei is not None and futures is not None and nikkei["close"] > 0:
+        futures_gap = (futures / nikkei["close"] - 1) * 100
+
+    japan_change = None
+    if nikkei is not None and futures_gap is not None:
+        japan_change = nikkei["change"] * 0.4 + futures_gap * 0.6
+    elif nikkei is not None:
+        japan_change = nikkei["change"]
+    elif futures_gap is not None:
+        japan_change = futures_gap
+
+    japan_score = morning_score(japan_change)
+    us_score = morning_score(nasdaq["change"] if nasdaq else None)
+    total_score = japan_score + us_score
+
+    fx_label = "取得不可"
+    if usd_jpy is not None:
+        if usd_jpy["change"] >= 0.5:
+            fx_label = "円安方向"
+        elif usd_jpy["change"] <= -0.5:
+            fx_label = "円高方向"
+        else:
+            fx_label = "大きな変化なし"
+
+    return {
+        "overall": morning_label(total_score),
+        "nikkei_futures": futures_gap,
+        "us_tech": morning_label(us_score),
+        "sox": morning_label(morning_score(sox["change"] if sox else None)),
+        "fx": fx_label,
+    }
+
+
+def show_morning_market_brief():
+    st.subheader("🌅 8:55 朝イチ速報")
+    with st.spinner("地合いを確認しています..."):
+        brief = get_morning_market_brief()
+
+    st.metric("今日の地合い", brief["overall"])
+    futures_text = "取得不可"
+    if brief["nikkei_futures"] is not None:
+        futures_text = f'{brief["nikkei_futures"]:+.2f}%'
+    st.write(f'**日経先物（前日終値比）**　{futures_text}')
+    st.write(f'**米国ハイテク**　{brief["us_tech"]}')
+    st.write(f'**半導体（SOX）**　{brief["sox"]}')
+    st.write(f'**為替**　{brief["fx"]}')
+    st.caption("ここで地合いだけ確認し、個別銘柄の気配・板・当日材料はSBIで見ます。指数データは取得時点の情報です。")
+
+
+def download_intraday_data(code):
+    """直近5営業日の5分足を取得する。取得不能でも日足分析は継続する。"""
+    try:
+        data = yf.download(
+            f"{code}.T",
+            period="5d",
+            interval="5m",
+            auto_adjust=False,
+            progress=False,
+            prepost=False,
+            timeout=15,
+        )
+    except Exception:
+        return None
+
+    if data is None or data.empty:
+        return None
+
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    if any(col not in data.columns for col in required):
+        return None
+
+    data = data[required].dropna().copy()
+    return data if len(data) >= 26 else None
+
+
+def analyze_intraday_entry(data, daytrade):
+    """前日高値・安値に対する5分足の抜けと維持を簡易判定する。"""
+    if data is None or len(data) < 26:
+        return {"available": False}
+
+    df = data.copy()
+    df["MA5"] = df["Close"].rolling(5).mean()
+    df["MA25"] = df["Close"].rolling(25).mean()
+    df["Volume20"] = df["Volume"].rolling(20).mean()
+    latest = df.iloc[-1]
+    recent = df.iloc[-3:]
+
+    price = float(latest["Close"])
+    ma5 = float(latest["MA5"])
+    ma25 = float(latest["MA25"])
+    volume_ratio = float(latest["Volume"] / latest["Volume20"]) if latest["Volume20"] > 0 else 0
+    recent_low = float(recent["Low"].min())
+    recent_high = float(recent["High"].max())
+    prev_high = float(daytrade["prev_high"])
+    prev_low = float(daytrade["prev_low"])
+    trend_up = ma5 > ma25
+    trend_down = ma5 < ma25
+
+    # 先行判断は、最初の5分足が確定した時点から使う。
+    # 「3本維持」はエントリーを遅らせる条件ではなく、保有継続の確認に分ける。
+    if price > prev_high:
+        early_signal = "ロング候補（初動）"
+        early_detail = "前日高値を上抜けています。実際の板と約定を見て、初動として検討する場面です。"
+    elif price < prev_low:
+        early_signal = "ショート候補（初動）"
+        early_detail = "前日安値を下抜けています。実際の板と約定を見て、初動として検討する場面です。"
+    else:
+        early_signal = "分岐待ち"
+        early_detail = "前日高値・安値の間です。先に抜けた側だけを候補にします。"
+
+    if price > prev_high and recent_low > prev_high:
+        if trend_up and volume_ratio >= 0.8:
+            signal = "ロング優先"
+            detail = "前日高値を上抜けた後、直近3本の5分足で上を維持しています。"
+        else:
+            signal = "上抜け維持・慎重ロング"
+            detail = "前日高値の上を維持中です。5分足の出来高と押し目の浅さを確認します。"
+        level_status = "前日高値を上抜けて維持"
+    elif price < prev_low and recent_high < prev_low:
+        if trend_down and volume_ratio >= 0.8:
+            signal = "ショート優先"
+            detail = "前日安値を下抜けた後、直近3本の5分足で下を維持しています。"
+        else:
+            signal = "下抜け維持・慎重ショート"
+            detail = "前日安値の下を維持中です。5分足の出来高と戻りの弱さを確認します。"
+        level_status = "前日安値を下抜けて維持"
+    elif price > prev_high:
+        signal = "上抜け中・維持待ち"
+        detail = "前日高値は抜けましたが、まだ3本分の維持確認ができていません。"
+        level_status = "前日高値を上抜け"
+    elif price < prev_low:
+        signal = "下抜け中・維持待ち"
+        detail = "前日安値は割れましたが、まだ3本分の維持確認ができていません。"
+        level_status = "前日安値を下抜け"
+    else:
+        signal = "見送り・分岐待ち"
+        detail = "前日高値・安値の間です。どちらかを抜け、5分足で維持するまで待ちます。"
+        level_status = "前日レンジ内"
+
+    timestamp = data.index[-1]
+    time_label = timestamp.strftime("%m/%d %H:%M")
+    return {
+        "available": True,
+        "early_signal": early_signal,
+        "early_detail": early_detail,
+        "signal": signal,
+        "detail": detail,
+        "level_status": level_status,
+        "price": price,
+        "time_label": time_label,
+        "ma_direction": "上向き" if trend_up else "下向き" if trend_down else "横ばい",
+        "volume_ratio": volume_ratio,
+        "prev_high": prev_high,
+        "prev_low": prev_low,
+    }
+
+
 def calculate_atr(data, period=14):
     high = data["High"]
     low = data["Low"]
@@ -2080,6 +2321,8 @@ def show_swing(result, earnings=None):
 # メイン画面
 # =========================================================
 st.title("🔍 カブグルマン★★★")
+show_morning_market_brief()
+st.divider()
 
 mode = st.radio(
     "何をしますか？",
