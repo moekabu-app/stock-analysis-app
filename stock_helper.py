@@ -2065,7 +2065,7 @@ def calculate_earnings_adjustment(earnings, price_date=None):
     }
 
 
-def show_earnings_summary(earnings, price_date=None):
+def show_earnings_summary(earnings, price_date=None, show_swing_effect=True):
     st.markdown("### 🧾 業績・決算")
 
     if not earnings or not earnings.get("ok"):
@@ -2436,7 +2436,8 @@ def show_earnings_summary(earnings, price_date=None):
 
     st.markdown("**決算の簡易評価**")
     st.write(f"業績評価：{earnings_view}")
-    st.write(f"スイングへの影響：{swing_effect}")
+    if show_swing_effect:
+        st.write(f"スイングへの影響：{swing_effect}")
     freshness_pct = adjustment["freshness_rate"] * 100
     days = adjustment["days_since_disclosure"]
     if days is None:
@@ -2596,7 +2597,55 @@ def show_daytrade(result):
     )
 
 
-def show_longterm(result, earnings=None):
+
+def analyze_profit_change(trend, code=None):
+    """通期実績で前年差を確認。一次資料の要因は検証済み銘柄・決算期に限る。"""
+    rows = (trend or {}).get("rows") or []
+    by_year = {}
+    for row in rows:
+        try:
+            year = int(str(row.get("年度", ""))[:4])
+            sales = float(row["売上高（億円）"])
+            profit = float(row["営業利益（億円）"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not (np.isfinite(sales) and np.isfinite(profit)) or year in by_year:
+            return {"summary": "年度や実績に不備があるため、利益変化を分析できません。", "factors": []}
+        by_year[year] = (sales, profit)
+    if len(by_year) < 2:
+        return {"summary": "連続する2年度の通期実績が必要です。", "factors": []}
+    latest_year = max(by_year)
+    if latest_year - 1 not in by_year:
+        return {"summary": "直近2年度が連続していないため、利益変化を分析できません。", "factors": []}
+    previous_sales, previous_profit = by_year[latest_year - 1]
+    latest_sales, latest_profit = by_year[latest_year]
+    sales_diff = latest_sales - previous_sales
+    profit_diff = latest_profit - previous_profit
+    direction = "増加" if profit_diff > 0 else "減少" if profit_diff < 0 else "横ばい"
+    summary = (f"{latest_year}年3月期：売上高は前年比 {sales_diff:+.1f}億円、"
+               f"営業利益は {profit_diff:+.1f}億円（{direction}）。")
+    output = {"summary": summary, "factors": [], "source": None, "note":
+              "金額の増減だけから減益の原因は断定できません。要因別の内訳は一次資料を照合した年度だけ表示します。"}
+    # 固定の公式資料を別年度や別銘柄へ流用しない。億円単位、表示丸め差を許容。
+    if (str(code) == "6526" and latest_year == 2026
+            and abs(previous_profit - 250.0) < 0.3
+            and abs(latest_profit - 123.54) < 0.3
+            and abs(previous_sales - 1885.35) < 0.3
+            and abs(latest_sales - 2008.34) < 0.3):
+        output["factors"] = [
+            ("製品粗利益", -120.0),
+            ("NRE売上", -27.0),
+            ("研究開発費・販管費など", 12.0),
+            ("為替影響", 9.0),
+        ]
+        output["source"] = "https://www.socionext.com/en/ir/pdf/sn_ir20260428_04e.pdf"
+        output["note"] = ("会社の2026年4月28日決算説明会資料（9ページ）にある前年差の要因分解。"
+                          "各項目は概数で、費用等のプラスは利益へのプラス寄与。"
+                          "合計は約-126億円で、実績の前年差との差は丸めによります。"
+                          "一時的・恒常的かの判断や将来の回復を保証するものではありません。")
+    return output
+
+def show_longterm(result, earnings=None, code=None):
     """中長期分析：重要事項を先に示し、採点根拠は必要時だけ展開する。"""
     st.subheader("🏢 中長期分析")
     fundamental = result["fundamental"]
@@ -2648,6 +2697,17 @@ def show_longterm(result, earnings=None):
                 st.write("・" + line)
             for note in growth["notes"]:
                 st.caption("・" + note)
+            st.markdown("**営業利益の変動要因（採点対象外）**")
+            profit_change = analyze_profit_change(trend, code=code)
+            st.write(profit_change["summary"])
+            if profit_change["factors"]:
+                st.dataframe(pd.DataFrame([
+                    {"会社資料の要因": name, "営業利益への寄与（億円）": amount}
+                    for name, amount in profit_change["factors"]
+                ]), hide_index=True, use_container_width=True)
+            st.caption(profit_change["note"])
+            if profit_change["source"]:
+                st.markdown(f'[根拠：会社公式の決算説明会資料（PDF）]({profit_change["source"]})')
         else:
             st.caption("過去5年間の通期実績は取得できませんでした。")
         for warning in trend.get("warnings", []):
@@ -2936,12 +2996,16 @@ if mode == "気になる銘柄を調べる":
             show_longterm(
                 result["longterm"],
                 result.get("longterm_earnings"),
+                code=code,
             )
-            # スイングも選択した場合は、上のスイング欄にある決算詳細を共用する。
-            # 中長期単独時にも元の決算資料を参照できるようにする。
+            # 決算データは中長期でも参照可能にする。スイング固有の影響表示だけ省略。
+            # 両方の分析を選択した場合はスイング側の決算詳細を共用し、重複表示しない。
             if "swing" not in result:
                 with st.expander("🧾 決算データ・短期用の業績評価を見る（中長期採点とは別）"):
-                    show_earnings_summary(result.get("longterm_earnings"))
+                    show_earnings_summary(
+                        result.get("longterm_earnings"),
+                        show_swing_effect=False,
+                    )
 
         st.button(
             "🔄 別の銘柄を調べる",
