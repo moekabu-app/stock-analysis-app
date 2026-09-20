@@ -72,7 +72,11 @@ def require_cloud_login():
             st.logout()
         st.stop()
 
-    st.sidebar.caption(f"ログイン中：{st.user.get('name', user_email)}")
+    try:
+        user_name = str(st.user["name"]).strip()
+    except (KeyError, TypeError, AttributeError):
+        user_name = user_email
+    st.sidebar.caption(f"ログイン中：{user_name or user_email}")
     if st.sidebar.button("ログアウト"):
         st.logout()
 
