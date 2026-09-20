@@ -1531,6 +1531,79 @@ def build_forecast_history_summary(earnings, latest):
     }
 
 
+def _annual_amount(value):
+    """financials の年次金額は円。表示用に億円へ変換する。"""
+    try:
+        number = float(value)
+        return number / 100_000_000 if np.isfinite(number) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def build_annual_trend(result):
+    """年次の同一年度重複を除き、年度・提出日を検証して最大5年表示する。"""
+    records = extract_list_from_data(result)
+    # API によっては data が直の配列で返る。
+    if isinstance(result, list):
+        records = result
+    by_year = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        raw_year = record.get("fiscal_year")
+        try:
+            year = int(str(raw_year)[:4])
+        except (ValueError, TypeError):
+            continue
+        if not 2000 <= year <= 2100:
+            continue
+        submit = str(record.get("submit_date") or "")
+        # 連結・単体が途中で混在しないよう、連単混在の行を除外する。
+        basis = record.get("basis")
+        if basis not in (None, "consolidated", "standalone"):
+            continue
+        if record.get("basis_source") == "mixed_provenance":
+            continue
+        if year not in by_year or submit > str(by_year[year].get("submit_date") or ""):
+            by_year[year] = record
+    selected = [by_year[y] for y in sorted(by_year)[-5:]]
+    bases = {r.get("basis") for r in selected if r.get("basis")}
+    standards = {r.get("accounting_standard") for r in selected if r.get("accounting_standard")}
+    rows = []
+    for r in selected:
+        rev = _annual_amount(r.get("revenue"))
+        op = _annual_amount(r.get("operating_income"))
+        rows.append({
+            "年度": str(r["fiscal_year"]),
+            "売上高（億円）": rev,
+            "営業利益（億円）": op,
+            "営業利益率（%）": round(op / rev * 100, 1) if rev is not None and rev > 0 and op is not None else None,
+            "提出日": str(r.get("submit_date") or "不明")[:10],
+        })
+    warnings = []
+    if len(rows) < 5:
+        warnings.append(f"年次決算は{len(rows)}年度分のみ取得できました。欠損年度は補完していません。")
+    if len(bases) > 1 or any(r.get("basis") is None for r in selected):
+        warnings.append("連結・単体の区分が混在または不明の年度があります。年度比較に注意してください。")
+    if len(standards) > 1:
+        warnings.append("会計基準が変わった年度があります。単純比較に注意してください。")
+    return {"rows": rows, "warnings": warnings}
+
+
+def fetch_annual_trend(edinet_code, api_key):
+    """既存の決算取得と同じ API キー・企業コードで年次実績のみ追加取得。"""
+    response, error = edinet_request_json(
+        f"{EDINETDB_BASE_URL}/companies/{edinet_code}/financials",
+        api_key, params={"years": 5, "period": "annual"},
+    )
+    if error:
+        return {"rows": [], "warnings": [f"過去5年の年次決算を取得できませんでした（{error}）。"]}
+    trend = build_annual_trend(response)
+    if not trend["rows"]:
+        trend["warnings"].append("年次実績が見つかりません。既存の採点は変更しません。")
+    return trend
+
+
 def fetch_earnings_summary(code):
     api_key = os.getenv("EDINETDB_API_KEY")
 
@@ -1603,8 +1676,19 @@ def fetch_earnings_summary(code):
             "message": "決算データが見つかりませんでした。"
         }
 
+    # API は新しい順の仕様だが、日付と対象期で再確認してから最新決算を決定する。
+    earnings = sorted(
+        [item for item in earnings if isinstance(item, dict)],
+        key=lambda item: (str(item.get("disclosure_date") or "")[:10],
+                          str(item.get("fiscal_year_end") or ""),
+                          str(item.get("quarter") or "")),
+        reverse=True,
+    )
+    if not earnings:
+        return {"ok": False, "message": "有効な決算データがありません。"}
     latest = earnings[0]
     forecast_history = build_forecast_history_summary(earnings, latest)
+    annual_trend = fetch_annual_trend(edinet_code, api_key)
     # 会社予想が対象とする期の直前の通期確定実績だけを比較対象にする。
     # Q4時点で翌期の会社予想が載るケースにも対応する。
     target_fye = forecast_target_fiscal_year_end(latest)
@@ -1724,6 +1808,7 @@ def fetch_earnings_summary(code):
         "previous_forecast": previous_forecast,
         "forecast_history": forecast_history,
         "previous_annual_actual": previous_annual_actual,
+        "annual_trend": annual_trend,
         "year_ago": year_ago,
     }
 
@@ -2483,6 +2568,16 @@ def show_longterm(result, earnings=None):
         st.warning("業績資料不足のため、総合点・ランクは表示していません。")
 
     with st.expander("採点の根拠・業績データを詳しく見る"):
+        # 5年推移は参考情報。スイングにも渡す共通 earnings から参照し、採点式を変更しない。
+        trend = (earnings or {}).get("annual_trend") or {}
+        st.markdown("**過去5年間の通期業績（実績）**")
+        if trend.get("rows"):
+            st.dataframe(pd.DataFrame(trend["rows"]), hide_index=True, use_container_width=True)
+            st.caption("金額は億円。通期の確定実績のみで、会社予想や四半期累計は含みません。")
+        else:
+            st.caption("過去5年間の通期実績は取得できませんでした。")
+        for warning in trend.get("warnings", []):
+            st.caption("注意：" + warning)
         st.markdown("**業績点の計算内訳**")
         if components:
             for item in components:
