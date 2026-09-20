@@ -444,7 +444,6 @@ def show_morning_market_brief():
     st.write(f'**米国ハイテク**　{brief["us_tech"]}')
     st.write(f'**半導体（SOX）**　{brief["sox"]}')
     st.write(f'**為替**　{brief["fx"]}')
-    st.caption("ここで地合いだけ確認し、個別銘柄の気配・板・当日材料はSBIで見ます。指数データは取得時点の情報です。")
 
 
 def download_intraday_data(code):
