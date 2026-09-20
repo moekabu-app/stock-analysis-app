@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import os
 import requests
+import hmac
 from email.utils import parsedate_to_datetime
 
 
@@ -26,13 +27,39 @@ def get_secret_section(section_name):
 
 
 def require_cloud_login():
-    """クラウド公開時だけGoogleログインとメール許可リストを有効にする。"""
+    """クラウド公開時だけ利用者制限を有効にする。"""
     app_settings = get_secret_section("app")
     require_login = bool(app_settings.get("require_login", False))
 
     # 自宅PCでの従来どおりの実行は、認証設定なしで利用できる。
     if not require_login:
         return
+
+    login_method = str(app_settings.get("login_method", "google")).strip().lower()
+
+    # 少人数での共有用。Google OAuthの設定なしで、合言葉を知る人だけを通す。
+    if login_method == "passcode":
+        expected_passcode = str(app_settings.get("access_passcode", ""))
+        if not expected_passcode:
+            st.error("合言葉が設定されていないため、アプリを開始できません。")
+            st.stop()
+
+        if st.session_state.get("cloud_access_granted", False):
+            if st.sidebar.button("ログアウト"):
+                st.session_state.cloud_access_granted = False
+                st.rerun()
+            return
+
+        st.title("🔒 銘柄選定お助けマン")
+        st.write("利用を許可された方専用です。")
+        entered_passcode = st.text_input("合言葉", type="password")
+        if st.button("入る"):
+            if hmac.compare_digest(entered_passcode, expected_passcode):
+                st.session_state.cloud_access_granted = True
+                st.rerun()
+            else:
+                st.error("合言葉が違います。")
+        st.stop()
 
     auth_settings = get_secret_section("auth")
     required_auth_keys = (
