@@ -2448,7 +2448,9 @@ def show_longterm(result, earnings=None):
     st.subheader("🏢 中長期分析")
     fundamental = result["fundamental"]
     total_label = (f'{result["score"]} / 100' if result["score"] is not None else "採点保留")
-    st.metric("中長期適性", result["grade"], total_label)
+    # st.metric の変動値（delta）は矢印SVGを伴うため、評価点はテキストで明示する。
+    # ランク／得点をひと続きに表示し、コピー時の不要な「svg」混入も避ける。
+    st.markdown(f'**中長期適性：{result["grade"]}　｜　{total_label}**')
     st.write(f'**判定**　{result["grade_text"]}')
 
     earnings_label = (f'{result["earnings_score"]} / 70点'
@@ -2526,8 +2528,8 @@ def show_longterm(result, earnings=None):
                  f'200日線 {longterm_display(result.get("ma200"))}')
         show_earnings_summary(earnings)
 
-    st.caption("独自の簡易参考指標（業績70点・チャート30点）。会社予想は実績ではなく、"
-               "必要利益の比較は達成確率や採点には使用しません。投資成果を保証するものではありません。")
+    st.caption("独自の簡易参考指標（業績70点・チャート30点）。会社予想と実績は区別し、"
+               "必要利益の比較は達成確率や採点には使用しません。")
 
 
 def show_swing(result, earnings=None):
@@ -2759,8 +2761,6 @@ if mode == "気になる銘柄を調べる":
                 result.get("longterm_earnings"),
             )
 
-        st.divider()
-
         st.button(
             "🔄 別の銘柄を調べる",
             use_container_width=True,
@@ -2774,8 +2774,6 @@ else:
         "デイトレ・スイング・中長期を別々にランキングする予定です。"
     )
 
-
-st.divider()
 
 st.caption(
     "分析結果は売買を保証するものではなく、"
