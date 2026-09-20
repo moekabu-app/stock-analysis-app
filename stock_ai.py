@@ -207,21 +207,12 @@ print("取得銘柄   :", ticker)
 # =========================================================
 # 個別株データ取得
 # =========================================================
-today = datetime.now()
-
-end_date = today + timedelta(days=1)
-start_date = today - timedelta(
-    days=365 * YEARS + 30
-)
-
 data = yf.download(
     ticker,
-    start=start_date.strftime("%Y-%m-%d"),
-    end=end_date.strftime("%Y-%m-%d"),
+    period=f"{YEARS}y",
     interval="1d",
     auto_adjust=False,
-    progress=False,
-    repair=True
+    progress=False
 )
 
 data = flatten_columns(data)
