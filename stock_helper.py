@@ -1,15 +1,10 @@
 import streamlit as st
 import yfinance as yf
+import re
 import pandas as pd
 import numpy as np
 import os
 import requests
-import hmac
-import re
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
 from email.utils import parsedate_to_datetime
 
 
@@ -17,7 +12,7 @@ from email.utils import parsedate_to_datetime
 # ページ設定
 # =========================================================
 st.set_page_config(
-    page_title="カブグルマン★★★",
+    page_title="銘柄選定お助けマン",
     page_icon="🔍",
     layout="centered"
 )
@@ -32,42 +27,13 @@ def get_secret_section(section_name):
 
 
 def require_cloud_login():
-    """クラウド公開時だけ利用者制限を有効にする。"""
+    """クラウド公開時だけGoogleログインとメール許可リストを有効にする。"""
     app_settings = get_secret_section("app")
     require_login = bool(app_settings.get("require_login", False))
 
     # 自宅PCでの従来どおりの実行は、認証設定なしで利用できる。
     if not require_login:
         return
-
-    login_method = str(app_settings.get("login_method", "google")).strip().lower()
-
-    # 少人数での共有用。Google OAuthの設定なしで、合言葉を知る人だけを通す。
-    if login_method == "passcode":
-        expected_passcode = str(app_settings.get("access_passcode", ""))
-        if not expected_passcode:
-            st.error("合言葉が設定されていないため、アプリを開始できません。")
-            st.stop()
-
-        if st.session_state.get("cloud_access_granted", False):
-            if st.sidebar.button("ログアウト"):
-                st.session_state.cloud_access_granted = False
-                st.rerun()
-            return
-
-        st.markdown('<p style="font-size:1.4rem; font-weight:700; white-space:nowrap;">🔒 カブグルマン★★★</p>', unsafe_allow_html=True)
-        st.write("利用を許可された方専用です。")
-        entered_passcode = st.text_input("合言葉", type="password") or ""
-        if st.button("enter"):
-            if hmac.compare_digest(
-                str(entered_passcode).encode("utf-8"),
-                expected_passcode.encode("utf-8"),
-            ):
-                st.session_state.cloud_access_granted = True
-                st.rerun()
-            else:
-                st.error("合言葉が違います。")
-        st.stop()
 
     auth_settings = get_secret_section("auth")
     required_auth_keys = (
@@ -83,35 +49,26 @@ def require_cloud_login():
         st.stop()
 
     if not st.user.is_logged_in:
-        st.markdown('<p style="font-size:1.4rem; font-weight:700; white-space:nowrap;">🔒 カブグルマン★★★</p>', unsafe_allow_html=True)
+        st.title("🔒 銘柄選定お助けマン")
         st.write("このアプリは利用を許可された方専用です。")
         if st.button("Googleでログイン"):
             st.login()
         st.stop()
 
-    # Streamlitの版によっては st.user が dict 風でも .get() を持たない。
-    # 添字アクセスに統一し、メール情報がない場合だけ許可しない。
-    try:
-        user_email = str(st.user["email"]).strip().lower()
-    except (KeyError, TypeError, AttributeError):
-        user_email = ""
+    user_email = str(st.user.get("email", "")).strip().lower()
     allowed_emails = {
         str(email).strip().lower()
         for email in app_settings.get("allowed_emails", [])
     }
 
     if not user_email or user_email not in allowed_emails:
-        st.markdown('<p style="font-size:1.4rem; font-weight:700; white-space:nowrap;">🔒 カブグルマン★★★</p>', unsafe_allow_html=True)
+        st.title("🔒 銘柄選定お助けマン")
         st.error("このGoogleアカウントには利用許可がありません。")
         if st.button("ログアウト"):
             st.logout()
         st.stop()
 
-    try:
-        user_name = str(st.user["name"]).strip()
-    except (KeyError, TypeError, AttributeError):
-        user_name = user_email
-    st.sidebar.caption(f"ログイン中：{user_name or user_email}")
+    st.sidebar.caption(f"ログイン中：{st.user.get('name', user_email)}")
     if st.sidebar.button("ログアウト"):
         st.logout()
 
@@ -145,120 +102,6 @@ def reset_analysis():
     st.session_state.helper_date = ""
     st.session_state.helper_styles = []
     st.session_state.stock_code_input = ""
-
-
-# =========================================================
-# 株価展望（旧 stock_ai.py をクラウドから呼び出す）
-# =========================================================
-def find_outlook_value(text, label):
-    pattern = rf"{re.escape(label)}\s*:\s*(.+)"
-    match = re.search(pattern, text)
-    return match.group(1).strip() if match else "-"
-
-
-def compact_outlook_price(value):
-    return value.replace("円付近", "").replace("円", "").strip()
-
-
-def parse_stock_outlook(output):
-    direction = find_outlook_value(output, "方向性")
-    volatility = find_outlook_value(output, "値動き傾向")
-    confidence = find_outlook_value(output, "予測信頼度")
-    market = {
-        "japan": find_outlook_value(output, "日本株地合い"),
-        "us_tech": find_outlook_value(output, "米国ハイテク"),
-        "semiconductor": find_outlook_value(output, "半導体地合い"),
-        "asia": find_outlook_value(output, "アジア地合い"),
-        "fx": find_outlook_value(output, "為替環境"),
-        "total": find_outlook_value(output, "総合地合い"),
-    }
-
-    zones = {
-        "up": {"first": "-", "middle": "-", "main": "-", "major": "-"},
-        "down": {"first": "-", "middle": "-", "main": "-", "major": "-"},
-    }
-    current_direction = None
-    for line in output.splitlines():
-        stripped = line.strip()
-        if stripped == "【上方向】":
-            current_direction = "up"
-            continue
-        if stripped == "【下方向】":
-            current_direction = "down"
-            continue
-        if current_direction not in zones:
-            continue
-        value = line.split(":", 1)[-1].strip() if ":" in line else "-"
-        if "① 最初の分岐" in line:
-            zones[current_direction]["first"] = value
-        elif "途中警戒" in line:
-            zones[current_direction]["middle"] = value
-        elif "② 本命分岐" in line:
-            zones[current_direction]["main"] = value
-        elif "③ 大きな節目" in line:
-            zones[current_direction]["major"] = value
-
-    detail_lines = output.splitlines()
-    detail_start = next(
-        (
-            index
-            for index, line in enumerate(detail_lines)
-            if "今日のデイトレ展望" in line
-        ),
-        0,
-    )
-    return {
-        "direction": direction,
-        "volatility": volatility,
-        "confidence": confidence,
-        "market": market,
-        "zones": zones,
-        "detail": "\n".join(detail_lines[detail_start:]),
-    }
-
-
-def run_stock_outlook(code):
-    script_path = Path(__file__).parent / "stock_ai.py"
-    if not script_path.exists():
-        return {
-            "error": "株価展望エンジンが見つかりません。stock_ai.py を同じ場所へ追加してください。"
-        }
-
-    environment = os.environ.copy()
-    environment["STOCK_AI_SKIP_EXPORT"] = "1"
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            completed = subprocess.run(
-                [sys.executable, str(script_path)],
-                # 最初は銘柄コード、最後は旧プログラムの終了確認用Enter。
-                input=f"{code}\n\n",
-                text=True,
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=temp_dir,
-                env=environment,
-                timeout=180,
-            )
-    except subprocess.TimeoutExpired:
-        return {"error": "株価展望の計算に時間がかかりすぎました。もう一度お試しください。"}
-    except Exception as exc:
-        return {"error": f"株価展望を開始できませんでした：{exc}"}
-
-    output = completed.stdout or ""
-    error_output = completed.stderr or ""
-    if not output.strip():
-        return {
-            "error": "株価展望エンジンが結果を返せませんでした。",
-            "detail": error_output[-2000:] or "エラー詳細を取得できませんでした。",
-        }
-    if "株価データを取得できませんでした" in output:
-        return {"error": "株価展望用の株価データを取得できませんでした。"}
-
-    result = parse_stock_outlook(output)
-    if completed.returncode != 0:
-        result["warning"] = "一部の参考データを取得できず、表示を簡略化している可能性があります。"
-    return result
 
 
 # =========================================================
@@ -317,198 +160,6 @@ def download_stock_data(code):
     return data
 
 
-def fetch_market_snapshot(symbol):
-    """寄り前に使う指数の直近騰落率を取得する。"""
-    try:
-        data = yf.download(
-            symbol,
-            period="10d",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            timeout=15,
-        )
-        if data is None or data.empty:
-            return None
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        data = data.dropna(subset=["Close"])
-        if len(data) < 2:
-            return None
-        close = float(data["Close"].iloc[-1])
-        previous = float(data["Close"].iloc[-2])
-        return {"close": close, "change": (close / previous - 1) * 100}
-    except Exception:
-        return None
-
-
-def fetch_nikkei_futures():
-    try:
-        data = yf.download(
-            "NKD=F",
-            period="5d",
-            interval="1h",
-            auto_adjust=False,
-            progress=False,
-            timeout=15,
-        )
-        if data is None or data.empty:
-            return None
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        data = data.dropna(subset=["Close"])
-        return float(data["Close"].iloc[-1]) if not data.empty else None
-    except Exception:
-        return None
-
-
-def morning_score(change):
-    if change is None or pd.isna(change):
-        return 0
-    if change >= 1.0:
-        return 2
-    if change >= 0.30:
-        return 1
-    if change <= -1.0:
-        return -2
-    if change <= -0.30:
-        return -1
-    return 0
-
-
-def morning_label(score):
-    if score >= 2:
-        return "強い追い風"
-    if score == 1:
-        return "追い風"
-    if score <= -2:
-        return "強い逆風"
-    if score == -1:
-        return "逆風"
-    return "中立"
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_morning_market_brief():
-    """8:55に一画面で見るための、寄り前地合い要約。"""
-    nikkei = fetch_market_snapshot("^N225")
-    nasdaq = fetch_market_snapshot("^IXIC")
-    sox = fetch_market_snapshot("^SOX")
-    usd_jpy = fetch_market_snapshot("JPY=X")
-    futures = fetch_nikkei_futures()
-
-    futures_gap = None
-    if nikkei is not None and futures is not None and nikkei["close"] > 0:
-        futures_gap = (futures / nikkei["close"] - 1) * 100
-
-    japan_change = None
-    if nikkei is not None and futures_gap is not None:
-        japan_change = nikkei["change"] * 0.4 + futures_gap * 0.6
-    elif nikkei is not None:
-        japan_change = nikkei["change"]
-    elif futures_gap is not None:
-        japan_change = futures_gap
-
-    japan_score = morning_score(japan_change)
-    us_score = morning_score(nasdaq["change"] if nasdaq else None)
-    total_score = japan_score + us_score
-
-    fx_label = "取得不可"
-    if usd_jpy is not None:
-        if usd_jpy["change"] >= 0.5:
-            fx_label = "円安方向"
-        elif usd_jpy["change"] <= -0.5:
-            fx_label = "円高方向"
-        else:
-            fx_label = "大きな変化なし"
-
-    return {
-        "overall": morning_label(total_score),
-        "nikkei_futures": futures_gap,
-        "us_tech": morning_label(us_score),
-        "sox": morning_label(morning_score(sox["change"] if sox else None)),
-        "fx": fx_label,
-    }
-
-
-def show_morning_market_brief():
-    st.subheader("🌅 8:55 朝イチ速報")
-    with st.spinner("地合いを確認しています..."):
-        brief = get_morning_market_brief()
-
-    st.metric("今日の地合い", brief["overall"])
-    futures_text = "取得不可"
-    if brief["nikkei_futures"] is not None:
-        futures_text = f'{brief["nikkei_futures"]:+.2f}%'
-    st.write(f'**日経先物（前日終値比）**　{futures_text}')
-    st.write(f'**米国ハイテク**　{brief["us_tech"]}')
-    st.write(f'**半導体（SOX）**　{brief["sox"]}')
-    st.write(f'**為替**　{brief["fx"]}')
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_intraday_daytrade_adjustment(code):
-    """直近の5分足を、画面を増やさずデイトレ適性へ反映する。"""
-    try:
-        data = yf.download(
-            f"{code}.T",
-            period="60d",
-            interval="5m",
-            auto_adjust=False,
-            progress=False,
-            prepost=False,
-            timeout=30,
-        )
-        if data is None or data.empty:
-            return 0
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        data = data[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
-        if data.index.tz is not None:
-            data.index = data.index.tz_convert("Asia/Tokyo")
-
-        opening_ranges = []
-        opening_turnovers = []
-        for _, session in data.groupby(data.index.date):
-            opening = session.between_time("09:00", "09:29")
-            if len(opening) < 4:
-                continue
-            open_price = float(opening["Open"].iloc[0])
-            if open_price <= 0:
-                continue
-            opening_ranges.append(
-                (float(opening["High"].max()) - float(opening["Low"].min()))
-                / open_price * 100
-            )
-            opening_turnovers.append(
-                float((opening["Close"] * opening["Volume"]).sum()) / 100_000_000
-            )
-
-        if len(opening_ranges) < 10:
-            return 0
-
-        range_average = float(np.mean(opening_ranges))
-        turnover_average = float(np.mean(opening_turnovers))
-        adjustment = 0
-        if range_average >= 2.0:
-            adjustment += 4
-        elif range_average >= 1.2:
-            adjustment += 2
-        elif range_average < 0.5:
-            adjustment -= 3
-
-        if turnover_average >= 10:
-            adjustment += 4
-        elif turnover_average >= 3:
-            adjustment += 2
-        elif turnover_average < 0.5:
-            adjustment -= 3
-
-        return adjustment
-    except Exception:
-        return 0
-
-
 def calculate_atr(data, period=14):
     high = data["High"]
     low = data["Low"]
@@ -531,7 +182,7 @@ def calculate_atr(data, period=14):
 # =========================================================
 # デイトレ簡易分析
 # =========================================================
-def analyze_daytrade(data, intraday_adjustment=0):
+def analyze_daytrade(data):
     df = data.copy()
 
     df["MA5"] = df["Close"].rolling(5).mean()
@@ -546,7 +197,6 @@ def analyze_daytrade(data, intraday_adjustment=0):
     df["Low20"] = df["Low"].rolling(20).min()
 
     latest = df.iloc[-1]
-    previous = df.iloc[-2]
 
     close = float(latest["Close"])
     ma5 = float(latest["MA5"])
@@ -557,9 +207,6 @@ def analyze_daytrade(data, intraday_adjustment=0):
     turnover20 = float(latest["Turnover20"])
     high20 = float(latest["High20"])
     low20 = float(latest["Low20"])
-    prev_close = float(previous["Close"])
-    prev_high = float(previous["High"])
-    prev_low = float(previous["Low"])
 
     atr_pct = atr14 / close * 100 if close > 0 else 0
     volume_ratio = volume / volume20 if volume20 > 0 else 0
@@ -657,9 +304,7 @@ def analyze_daytrade(data, intraday_adjustment=0):
         + volume_score
         + trend_score
         + position_score
-        + intraday_adjustment
     )
-    total = max(0, min(100, total))
 
     if total >= 85:
         grade = "A"
@@ -694,38 +339,6 @@ def analyze_daytrade(data, intraday_adjustment=0):
     comments.append(f"短期トレンドは「{trend_label}」です。")
     comments.append(f"現在位置は「{position_label}」です。")
 
-    # -----------------------------------------------------------------
-    # 当日デイトレ展望（前日の日足を基準にした朝の準備用）
-    # -----------------------------------------------------------------
-    close_vs_ma5_pct = (close / ma5 - 1) * 100 if ma5 > 0 else 0
-    if ma_gap_pct >= 0.8 and close_vs_ma5_pct >= 0:
-        outlook = "上方向優勢"
-        outlook_detail = "前日高値を上抜けて維持できるかを確認する局面です。"
-        invalidation = "前日安値を明確に割れるなら、上目線は一度取り消しです。"
-    elif ma_gap_pct <= -0.8 and close_vs_ma5_pct <= 0:
-        outlook = "下方向警戒"
-        outlook_detail = "前日安値を割るか、戻りが前日高値で抑えられるかを確認する局面です。"
-        invalidation = "前日高値を上抜けて維持するなら、下目線は一度取り消しです。"
-    else:
-        outlook = "上下拮抗"
-        outlook_detail = "寄り後に前日高値・安値のどちらを先に抜けて維持するかを待つ局面です。"
-        invalidation = "どちらかの前日値を抜けて維持した側を、その日の優先方向として見ます。"
-
-    confidence_points = 0
-    if abs(ma_gap_pct) >= 2:
-        confidence_points += 1
-    if volume_ratio >= 1.4:
-        confidence_points += 1
-    if atr_pct >= 2:
-        confidence_points += 1
-
-    if confidence_points >= 3:
-        outlook_confidence = "高め"
-    elif confidence_points >= 2:
-        outlook_confidence = "中"
-    else:
-        outlook_confidence = "低め"
-
     return {
         "score": int(total),
         "grade": grade,
@@ -737,17 +350,7 @@ def analyze_daytrade(data, intraday_adjustment=0):
         "trend": trend_label,
         "ma_gap_pct": ma_gap_pct,
         "position": position_label,
-        "comments": comments,
-        "outlook": outlook,
-        "outlook_detail": outlook_detail,
-        "outlook_confidence": outlook_confidence,
-        "invalidation": invalidation,
-        "prev_close": prev_close,
-        "prev_high": prev_high,
-        "prev_low": prev_low,
-        "atr14": atr14,
-        "up_target": prev_close + atr14,
-        "down_target": max(0, prev_close - atr14),
+        "comments": comments
     }
 
 
@@ -985,246 +588,6 @@ def analyze_swing(data):
         "low60": low60,
         "data_date": pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d"),
         "comments": comments
-    }
-
-
-def score_longterm_fundamentals(earnings, price_date=None):
-    """中長期用の実績・通期見通しを70点で参考採点する（簡易・独自ルール）。"""
-    empty = {"score": None, "coverage": 0, "provisional": True, "components": [],
-             "reasons": ["業績データを取得できないため、業績点は算出しません。"], "notes": []}
-    if not isinstance(earnings, dict) or not earnings.get("ok"):
-        return empty
-
-    try:
-        disclosure = pd.Timestamp(earnings.get("disclosure_date"))
-        price = pd.Timestamp(price_date)
-        if pd.notna(disclosure) and pd.notna(price) and disclosure.normalize() > price.normalize():
-            return {**empty, "reasons": ["株価基準日より後の決算は採点に使用しません。"]}
-    except (TypeError, ValueError):
-        pass
-
-    def num(value):
-        try:
-            n = float(value)
-            return n if np.isfinite(n) else None
-        except (TypeError, ValueError):
-            return None
-
-    def change(current, previous):
-        return (current - previous) / abs(previous) * 100 if (
-            current is not None and previous is not None and previous > 0) else None
-
-    components = []
-    notes = []
-
-    def add(label, score, maximum, explanation):
-        components.append({"label": label, "score": score, "max": maximum,
-                           "explanation": explanation})
-
-    history = earnings.get("forecast_history") or {}
-    previous = earnings.get("year_ago") or {}
-    rev, op = num(earnings.get("revenue")), num(earnings.get("operating_income"))
-    prev_rev, prev_op = num(previous.get("revenue")), num(previous.get("operating_income"))
-    forecast_rev = num(earnings.get("forecast_revenue"))
-    forecast_op = num(earnings.get("forecast_operating_income"))
-    prior_annual = earnings.get("previous_annual_actual") or {}
-    annual_rev = num(prior_annual.get("revenue"))
-    annual_op = num(prior_annual.get("operating_income"))
-
-    # 実績20点：同一四半期・同一集計期間だけを比較する。
-    if op is not None and prev_op is not None:
-        if prev_op <= 0 < op:
-            pts, desc = 20, "営業利益が黒字転換"
-        elif prev_op >= 0 > op:
-            pts, desc = 0, "営業利益が赤字転落"
-        elif prev_op < 0 and op < 0:
-            pts, desc = (10 if op > prev_op else 0), ("営業赤字が縮小" if op > prev_op else "営業赤字が拡大または横ばい")
-        elif prev_op > 0:
-            rate = change(op, prev_op)
-            pts = 16 if rate >= 20 else 13 if rate >= 10 else 10 if rate >= 0 else 5 if rate > -20 else 0
-            desc = f"営業利益の前年同期比 {rate:+.1f}%"
-        else:
-            pts, desc = (10 if op == 0 else 0), "営業利益がゼロ付近"
-        rev_rate = change(rev, prev_rev)
-        if rev_rate is not None:
-            pts = min(20, max(0, pts + (4 if rev_rate >= 10 else -4 if rev_rate <= -10 else 0)))
-            desc += f"、売上高 {rev_rate:+.1f}%"
-        add("前年同期の実績", pts, 20, desc)
-
-    # 通期見通し25点：前期通期の確定実績と当期通期予想を比較。
-    # 同じ対象年度の比較先を特定できない場合は欠損扱い（四半期実績とは比較しない）。
-    if forecast_op is not None and annual_op is not None:
-        if annual_op <= 0 < forecast_op:
-            pts, desc = 25, "通期営業利益は黒字転換予想"
-        elif annual_op >= 0 > forecast_op:
-            pts, desc = 0, "通期営業利益は赤字転落予想"
-        elif annual_op < 0 and forecast_op < 0:
-            pts = 12 if forecast_op > annual_op else 0
-            desc = "通期営業赤字は縮小予想" if pts else "通期営業赤字は拡大または横ばい予想"
-        elif annual_op > 0:
-            rate = change(forecast_op, annual_op)
-            pts = 20 if rate >= 20 else 17 if rate >= 10 else 13 if rate >= 0 else 7 if rate > -20 else 0
-            desc = f"通期営業利益の前期比予想 {rate:+.1f}%"
-        else:
-            pts, desc = (12 if forecast_op == 0 else 0), "通期営業利益はゼロ付近の予想"
-        rev_rate = change(forecast_rev, annual_rev)
-        if rev_rate is not None:
-            pts = min(25, max(0, pts + (5 if rev_rate >= 10 else -5 if rev_rate <= -10 else 0)))
-            desc += f"、売上高 {rev_rate:+.1f}%"
-        add("通期会社予想と前期実績", pts, 25, desc)
-    else:
-        notes.append("通期会社予想と前期実績：対応する前期通期実績または当期予想がなく、採点対象外。")
-
-    # 会社予想の修正15点：初回→最新（同一年度）。予想履歴がなければ欠損。
-    if history:
-        judgment = history.get("overall_judgment")
-        scores = {"上方修正": 15, "予想維持": 8, "下方修正": 0,
-                  "EPSのみ上方修正": 10, "EPSのみ下方修正": 5}
-        if judgment in scores:
-            add("会社予想の修正", scores[judgment], 15, f"同一年度の初回から最新：{judgment}")
-        elif judgment == "混合修正":
-            first = num((history.get("first") or {}).get("forecast_operating_income"))
-            latest = num((history.get("latest") or {}).get("forecast_operating_income"))
-            if first is not None and latest is not None:
-                pts = 11 if latest > first else 4 if latest < first else 8
-                add("会社予想の修正", pts, 15, "混合修正：営業利益予想の変更方向を参考")
-
-    # 予想利益率10点：四半期の一時的な赤字と通期の予想利益率は別々に見せる。
-    if forecast_rev is not None and forecast_rev > 0 and forecast_op is not None:
-        margin = forecast_op / forecast_rev * 100
-        pts = 10 if margin >= 15 else 8 if margin >= 10 else 6 if margin >= 5 else 3 if margin >= 0 else 0
-        add("通期予想営業利益率", pts, 10, f"会社予想の営業利益率 {margin:.1f}%")
-
-    if rev is not None and rev > 0 and op is not None:
-        notes.append(f"直近決算の営業利益率 {op/rev*100:+.1f}%（実績の前年比とあわせて参照）")
-    progress = num(earnings.get("operating_progress"))
-    if progress is not None:
-        notes.append(f"営業利益の単純進捗率 {progress:+.1f}%（季節性を補正していないため加点・減点なし）")
-
-    # 決算DBの金額単位は百万円。残り期間の必要利益と前年同期間を比較する。
-    # Q4は通期実績のため、残り期間の計算対象にしない。
-    quarter = str(earnings.get("quarter", "")).upper().replace("Q", "")
-    if quarter in ("1", "2", "3") and forecast_op is not None and op is not None:
-        remaining = forecast_op - op
-        notes.append(
-            f"通期予想達成に残り期間で必要な営業利益：{remaining / 100:.1f}億円"
-            f"（通期予想 {forecast_op / 100:.1f}億円 − 累計実績 {op / 100:.1f}億円）"
-        )
-        if annual_op is not None and prev_op is not None:
-            prior_remaining = annual_op - prev_op
-            notes.append(f"前年の同じ残り期間の営業利益：{prior_remaining / 100:.1f}億円")
-            if prior_remaining > 0:
-                required_growth = (remaining / prior_remaining - 1) * 100
-                notes.append(
-                    f"残り期間に必要な営業利益の前年同期比：{required_growth:+.1f}%"
-                    "（達成確率ではなく必要水準の比較。季節性・会社計画の内訳は未反映、採点への加減点なし）"
-                )
-            else:
-                notes.append("前年の残り期間の営業利益がゼロ以下のため、必要増益率は算出しません。")
-        else:
-            notes.append("前年の対応する通期・累計実績が不足しており、残り期間の前年比較はできません。")
-    notes.append("会社予想は未達の可能性があり、実績とは区別して表示しています。")
-
-    maximum = sum(item["max"] for item in components)
-    if maximum < 45:
-        return {"score": None, "coverage": maximum, "provisional": True,
-                "components": components, "notes": notes,
-                "reasons": ["採点可能な根拠が45/70点分に満たないため採点保留。"]}
-    raw = sum(item["score"] for item in components)
-    score = int(raw / maximum * 70 + 0.5)
-    return {"score": score, "coverage": maximum, "provisional": maximum < 70,
-            "components": components, "notes": notes,
-            "reasons": ["採点できた項目のみを70点満点へ換算した暫定点です。" if maximum < 70
-                        else "4項目を合計した簡易参考点です。"]}
-
-
-# =========================================================
-# 中長期分析
-# =========================================================
-def analyze_longterm(data, earnings=None):
-    """業績と約1年の株価位置から、中長期の保有候補としての強さを見る。"""
-    df = data.copy()
-    df["MA50"] = df["Close"].rolling(50).mean()
-    df["MA200"] = df["Close"].rolling(200).mean()
-
-    latest = df.iloc[-1]
-    close = float(latest["Close"])
-    ma50 = float(latest["MA50"])
-    ma200 = float(latest["MA200"])
-    # 取得本数が252営業日にわずかに届かない場合でも、
-    # 取得できた約1年分を使って高値・安値を出す。
-    yearly_data = df.tail(252)
-    # 欠損値や文字列を除外し、有効な高値・安値だけで年間レンジを計算する。
-    yearly_highs = pd.to_numeric(yearly_data["High"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    yearly_lows = pd.to_numeric(yearly_data["Low"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    high252 = float(yearly_highs.max()) if not yearly_highs.empty else float("nan")
-    low252 = float(yearly_lows.min()) if not yearly_lows.empty else float("nan")
-
-    return120 = (close / float(df["Close"].iloc[-121]) - 1) * 100 if len(df) >= 121 else 0
-    return240 = (close / float(df["Close"].iloc[-241]) - 1) * 100 if len(df) >= 241 else 0
-    valid_yearly_range = (np.isfinite(high252) and np.isfinite(low252)
-                          and np.isfinite(close) and high252 > low252)
-    range_position = (close - low252) / (high252 - low252) if valid_yearly_range else float("nan")
-
-    # テクニカルは最大30点。中長期では、業績の補助確認として扱う。
-    chart_score = 0
-    if close > ma200:
-        chart_score += 10
-    if ma50 > ma200:
-        chart_score += 8
-    if return240 > 0:
-        chart_score += 6
-    elif return240 > -10:
-        chart_score += 3
-    if valid_yearly_range:
-        if 0.30 <= range_position <= 0.85:
-            chart_score += 6
-        elif range_position > 0.85:
-            chart_score += 4
-        else:
-            chart_score += 2
-
-    if close > ma200 and ma50 > ma200:
-        chart_label = "長期上昇基調"
-    elif close < ma200 and ma50 < ma200:
-        chart_label = "長期下降基調"
-    else:
-        chart_label = "長期は転換・調整局面"
-
-    # 中長期専用の業績採点。スイング向けの決算鮮度補正は使わない。
-    fundamental = score_longterm_fundamentals(
-        earnings, pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d")
-    )
-    earnings_score = fundamental["score"]
-    total = min(100, chart_score + earnings_score) if earnings_score is not None else None
-
-    if total is None:
-        grade, grade_text = "—", "業績資料不足のため採点保留"
-    elif total >= 75:
-        grade, grade_text = "A", "中長期の保有候補として良好"
-    elif total >= 60:
-        grade, grade_text = "B", "中長期で検討しやすい"
-    elif total >= 45:
-        grade, grade_text = "C", "業績・株価の確認を続けたい"
-    else:
-        grade, grade_text = "D", "現時点では優先度低め"
-
-    return {
-        "score": total,
-        "grade": grade,
-        "grade_text": grade_text,
-        "chart_score": chart_score,
-        "earnings_score": earnings_score,
-        "fundamental": fundamental,
-        "chart_label": chart_label,
-        "return120": return120,
-        "return240": return240,
-        "range_position": range_position,
-        "ma50": ma50,
-        "ma200": ma200,
-        "high252": high252,
-        "low252": low252,
-        "earnings_adjustment": fundamental,
     }
 
 
@@ -1531,147 +894,6 @@ def build_forecast_history_summary(earnings, latest):
     }
 
 
-def _annual_amount(value):
-    """financials の年次金額は円。表示用に億円へ変換する。"""
-    try:
-        number = float(value)
-        return number / 100_000_000 if np.isfinite(number) else None
-    except (ValueError, TypeError):
-        return None
-
-
-def build_annual_trend(result):
-    """年次の同一年度重複を除き、年度・提出日を検証して最大5年表示する。"""
-    records = extract_list_from_data(result)
-    # API によっては data が直の配列で返る。
-    if isinstance(result, list):
-        records = result
-    by_year = {}
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        raw_year = record.get("fiscal_year")
-        try:
-            year = int(str(raw_year)[:4])
-        except (ValueError, TypeError):
-            continue
-        if not 2000 <= year <= 2100:
-            continue
-        submit = str(record.get("submit_date") or "")
-        # 連結・単体が途中で混在しないよう、連単混在の行を除外する。
-        basis = record.get("basis")
-        if basis not in (None, "consolidated", "standalone"):
-            continue
-        if record.get("basis_source") == "mixed_provenance":
-            continue
-        if year not in by_year or submit > str(by_year[year].get("submit_date") or ""):
-            by_year[year] = record
-    selected = [by_year[y] for y in sorted(by_year)[-5:]]
-    bases = {r.get("basis") for r in selected if r.get("basis")}
-    standards = {r.get("accounting_standard") for r in selected if r.get("accounting_standard")}
-    rows = []
-    for r in selected:
-        rev = _annual_amount(r.get("revenue"))
-        op = _annual_amount(r.get("operating_income"))
-        rows.append({
-            "年度": str(r["fiscal_year"]),
-            "売上高（億円）": rev,
-            "営業利益（億円）": op,
-            "営業利益率（%）": round(op / rev * 100, 1) if rev is not None and rev > 0 and op is not None else None,
-            "提出日": str(r.get("submit_date") or "不明")[:10],
-        })
-    warnings = []
-    if len(rows) < 5:
-        warnings.append(f"年次決算は{len(rows)}年度分のみ取得できました。欠損年度は補完していません。")
-    if len(bases) > 1 or any(r.get("basis") is None for r in selected):
-        warnings.append("連結・単体の区分が混在または不明の年度があります。年度比較に注意してください。")
-    if len(standards) > 1:
-        warnings.append("会計基準が変わった年度があります。単純比較に注意してください。")
-    return {"rows": rows, "warnings": warnings}
-
-
-
-def analyze_annual_growth(trend):
-    """通期実績だけから変化量を計算する。欠損・会計区分不明は推測補完しない。"""
-    rows = (trend or {}).get("rows") or []
-    clean = []
-    for row in rows:
-        try:
-            year = int(str(row.get("年度"))[:4])
-        except (ValueError, TypeError):
-            continue
-        clean.append((year, row))
-    clean.sort(key=lambda item: item[0])
-    # 年度の重複があれば曖昧な比較を避ける。
-    if len({year for year, _ in clean}) != len(clean):
-        return {"lines": [], "notes": ["年度が重複しているため、成長指標は計算していません。"]}
-    if len(clean) < 2:
-        return {"lines": [], "notes": ["通期実績が2年度以上必要です。"]}
-
-    def value(row, key):
-        try:
-            v = float(row.get(key))
-            return v if np.isfinite(v) else None
-        except (ValueError, TypeError):
-            return None
-
-    previous_year, previous = clean[-2]
-    latest_year, latest = clean[-1]
-    lines = []
-    notes = []
-    if latest_year == previous_year + 1:
-        for label, key in (("売上高", "売上高（億円）"), ("営業利益", "営業利益（億円）")):
-            old, current = value(previous, key), value(latest, key)
-            if old is not None and old > 0 and current is not None:
-                lines.append(f"直近の{label}：{previous_year}年度比 {((current / old) - 1) * 100:+.1f}%")
-            elif old is not None and old <= 0 and current is not None:
-                notes.append(f"{label}の直近増減率は前年値がゼロ以下のため算出していません。")
-        old_margin = value(previous, "営業利益率（%）")
-        current_margin = value(latest, "営業利益率（%）")
-        if old_margin is not None and current_margin is not None:
-            lines.append(f"直近の営業利益率：{old_margin:.1f}% → {current_margin:.1f}%（{current_margin - old_margin:+.1f}ポイント）")
-    else:
-        notes.append("最新2年度が連続していないため、直近の前年比は表示していません。")
-
-    earliest_year, earliest = clean[0]
-    intervals = latest_year - earliest_year
-    years_contiguous = intervals == len(clean) - 1
-    if years_contiguous and intervals > 0:
-        old_rev = value(earliest, "売上高（億円）")
-        new_rev = value(latest, "売上高（億円）")
-        if old_rev is not None and old_rev > 0 and new_rev is not None and new_rev >= 0:
-            cagr = ((new_rev / old_rev) ** (1 / intervals) - 1) * 100
-            lines.append(f"売上高の年平均増減率：{cagr:+.1f}%（{earliest_year}〜{latest_year}年度、{intervals}年間）")
-        else:
-            notes.append("売上高の年平均増減率は有効な開始・終了値がないため算出していません。")
-    else:
-        notes.append("年度に欠けがあるため、売上高の年平均増減率は算出していません。")
-
-    margins = [(year, value(row, "営業利益率（%）")) for year, row in clean]
-    margins = [(year, margin) for year, margin in margins if margin is not None]
-    if len(margins) >= 2:
-        first_year, first_margin = margins[0]
-        last_year, last_margin = margins[-1]
-        lines.append(f"期間初と最新の営業利益率：{first_margin:.1f}% → {last_margin:.1f}%（{last_margin - first_margin:+.1f}ポイント）")
-    notes.append("年次実績の変化を示す参考情報です。中長期37点など既存の採点には反映していません。")
-    notes.append("年平均増減率は年度間の複利換算であり、将来の成長率の予測ではありません。")
-    return {"lines": lines, "notes": notes}
-
-
-def fetch_annual_trend(edinet_code, api_key):
-    """既存の決算取得と同じ API キー・企業コードで年次実績のみ追加取得。"""
-    response, error = edinet_request_json(
-        f"{EDINETDB_BASE_URL}/companies/{edinet_code}/financials",
-        api_key, params={"years": 5, "period": "annual"},
-    )
-    if error:
-        return {"rows": [], "warnings": [f"過去5年の年次決算を取得できませんでした（{error}）。"]}
-    trend = build_annual_trend(response)
-    if not trend["rows"]:
-        trend["warnings"].append("年次実績が見つかりません。既存の採点は変更しません。")
-    return trend
-
-
 def fetch_earnings_summary(code):
     api_key = os.getenv("EDINETDB_API_KEY")
 
@@ -1744,36 +966,8 @@ def fetch_earnings_summary(code):
             "message": "決算データが見つかりませんでした。"
         }
 
-    # API は新しい順の仕様だが、日付と対象期で再確認してから最新決算を決定する。
-    earnings = sorted(
-        [item for item in earnings if isinstance(item, dict)],
-        key=lambda item: (str(item.get("disclosure_date") or "")[:10],
-                          str(item.get("fiscal_year_end") or ""),
-                          str(item.get("quarter") or "")),
-        reverse=True,
-    )
-    if not earnings:
-        return {"ok": False, "message": "有効な決算データがありません。"}
     latest = earnings[0]
     forecast_history = build_forecast_history_summary(earnings, latest)
-    annual_trend = fetch_annual_trend(edinet_code, api_key)
-    # 会社予想が対象とする期の直前の通期確定実績だけを比較対象にする。
-    # Q4時点で翌期の会社予想が載るケースにも対応する。
-    target_fye = forecast_target_fiscal_year_end(latest)
-    previous_annual_actual = None
-    try:
-        prior_fye = (pd.Timestamp(target_fye) - pd.DateOffset(years=1)).strftime("%Y-%m-%d")
-        for item in earnings:
-            if (str(item.get("fiscal_year_end"))[:10] == prior_fye
-                    and str(item.get("quarter")).upper() in ("4", "Q4")):
-                previous_annual_actual = {
-                    "fiscal_year_end": prior_fye,
-                    "revenue": item.get("revenue"),
-                    "operating_income": item.get("operating_income"),
-                }
-                break
-    except (TypeError, ValueError):
-        pass
 
     fiscal_year_end = latest.get("fiscal_year_end")
     quarter = latest.get("quarter")
@@ -1875,8 +1069,6 @@ def fetch_earnings_summary(code):
         "operating_progress": operating_progress,
         "previous_forecast": previous_forecast,
         "forecast_history": forecast_history,
-        "previous_annual_actual": previous_annual_actual,
-        "annual_trend": annual_trend,
         "year_ago": year_ago,
     }
 
@@ -2065,7 +1257,7 @@ def calculate_earnings_adjustment(earnings, price_date=None):
     }
 
 
-def show_earnings_summary(earnings, price_date=None, show_swing_effect=True):
+def show_earnings_summary(earnings, price_date=None):
     st.markdown("### 🧾 業績・決算")
 
     if not earnings or not earnings.get("ok"):
@@ -2436,8 +1628,7 @@ def show_earnings_summary(earnings, price_date=None, show_swing_effect=True):
 
     st.markdown("**決算の簡易評価**")
     st.write(f"業績評価：{earnings_view}")
-    if show_swing_effect:
-        st.write(f"スイングへの影響：{swing_effect}")
+    st.write(f"スイングへの影響：{swing_effect}")
     freshness_pct = adjustment["freshness_rate"] * 100
     days = adjustment["days_since_disclosure"]
     if days is None:
@@ -2493,81 +1684,8 @@ def show_earnings_summary(earnings, price_date=None, show_swing_effect=True):
 # =========================================================
 # 表示
 # =========================================================
-def show_stock_outlook(result):
-    st.subheader("📈 今日の株価展望")
-
-    if result.get("error"):
-        st.warning(result["error"])
-        if result.get("detail"):
-            with st.expander("株価展望のエラー詳細"):
-                st.code(result["detail"])
-        return
-
-    # スマホの縦画面でも文言が切れないよう、3列ではなく縦に表示する。
-    st.metric("方向性", result["direction"])
-    st.metric("値動き", result["volatility"])
-    st.metric("信頼度", result["confidence"])
-
-    zones = result["zones"]
-    up_prices = [
-        compact_outlook_price(zones["up"][key])
-        for key in ("first", "middle", "main", "major")
-        if zones["up"][key] != "-"
-    ]
-    down_prices = [
-        compact_outlook_price(zones["down"][key])
-        for key in ("first", "middle", "main", "major")
-        if zones["down"][key] != "-"
-    ]
-
-    st.markdown("**今日の重要価格**")
-    st.write(f'↑ 上方向　{" → ".join(up_prices) if up_prices else "取得できませんでした"}')
-    st.write(f'↓ 下方向　{" → ".join(down_prices) if down_prices else "取得できませんでした"}')
-
-    market = result["market"]
-    st.markdown("**地合い**")
-    st.write(f'総合：{market["total"]}')
-    with st.expander("地合いの内訳"):
-        st.write(f'日本株：{market["japan"]}')
-        st.write(f'米国ハイテク：{market["us_tech"]}')
-        st.write(f'半導体：{market["semiconductor"]}')
-        st.write(f'アジア：{market["asia"]}')
-        st.write(f'為替：{market["fx"]}')
-
-    if result.get("warning"):
-        st.caption(result["warning"])
-
-    with st.expander("株価展望の詳しい分析を見る"):
-        st.text(result["detail"])
-
-
 def show_daytrade(result):
-    st.subheader("☀️ 今日のデイトレ展望")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**基本目線**")
-        st.write(result["outlook"])
-    with c2:
-        st.markdown("**信頼度**")
-        st.write(result["outlook_confidence"])
-
-    st.write(result["outlook_detail"])
-
-    st.markdown("**朝に見る分岐ライン**")
-    st.write(
-        f'上の分岐：前日高値 {result["prev_high"]:.1f} 円　｜　'
-        f'下の分岐：前日安値 {result["prev_low"]:.1f} 円'
-    )
-    st.write(
-        f'目安の上値：{result["up_target"]:.1f} 円　｜　'
-        f'目安の下値：{result["down_target"]:.1f} 円　'
-        f'（ATR14：{result["atr14"]:.1f} 円）'
-    )
-    st.caption(result["invalidation"])
-
-    st.divider()
-    st.subheader("⚡ デイトレ適性")
+    st.subheader("⚡ デイトレ分析")
 
     c1, c2 = st.columns(2)
 
@@ -2593,179 +1711,9 @@ def show_daytrade(result):
             st.write(f"・{comment}")
 
     st.info(
-        "上の「今日の株価展望」で、重要価格・類似局面・地合いを確認できます。"
+        "詳しい方向性・重要価格・類似局面・地合いは"
+        "「株価展望」で確認してください。"
     )
-
-
-
-def analyze_profit_change(trend, code=None):
-    """通期実績で前年差を確認。一次資料の要因は検証済み銘柄・決算期に限る。"""
-    rows = (trend or {}).get("rows") or []
-    by_year = {}
-    for row in rows:
-        try:
-            year = int(str(row.get("年度", ""))[:4])
-            sales = float(row["売上高（億円）"])
-            profit = float(row["営業利益（億円）"])
-        except (TypeError, ValueError, KeyError):
-            continue
-        if not (np.isfinite(sales) and np.isfinite(profit)) or year in by_year:
-            return {"summary": "年度や実績に不備があるため、利益変化を分析できません。", "factors": []}
-        by_year[year] = (sales, profit)
-    if len(by_year) < 2:
-        return {"summary": "連続する2年度の通期実績が必要です。", "factors": []}
-    latest_year = max(by_year)
-    if latest_year - 1 not in by_year:
-        return {"summary": "直近2年度が連続していないため、利益変化を分析できません。", "factors": []}
-    previous_sales, previous_profit = by_year[latest_year - 1]
-    latest_sales, latest_profit = by_year[latest_year]
-    sales_diff = latest_sales - previous_sales
-    profit_diff = latest_profit - previous_profit
-    direction = "増加" if profit_diff > 0 else "減少" if profit_diff < 0 else "横ばい"
-    summary = (f"{latest_year}年3月期：売上高は前年比 {sales_diff:+.1f}億円、"
-               f"営業利益は {profit_diff:+.1f}億円（{direction}）。")
-    output = {"summary": summary, "factors": [], "source": None, "note":
-              "金額の増減だけから減益の原因は断定できません。要因別の内訳は一次資料を照合した年度だけ表示します。"}
-    # 固定の公式資料を別年度や別銘柄へ流用しない。億円単位、表示丸め差を許容。
-    if (str(code) == "6526" and latest_year == 2026
-            and abs(previous_profit - 250.0) < 0.3
-            and abs(latest_profit - 123.54) < 0.3
-            and abs(previous_sales - 1885.35) < 0.3
-            and abs(latest_sales - 2008.34) < 0.3):
-        output["factors"] = [
-            ("製品粗利益", -120.0),
-            ("NRE売上", -27.0),
-            ("研究開発費・販管費など", 12.0),
-            ("為替影響", 9.0),
-        ]
-        output["source"] = "https://www.socionext.com/en/ir/pdf/sn_ir20260428_04e.pdf"
-        output["note"] = ("会社の2026年4月28日決算説明会資料（9ページ）にある前年差の要因分解。"
-                          "各項目は概数で、費用等のプラスは利益へのプラス寄与。"
-                          "合計は約-126億円で、実績の前年差との差は丸めによります。"
-                          "一時的・恒常的かの判断や将来の回復を保証するものではありません。")
-    return output
-
-def show_longterm(result, earnings=None, code=None):
-    """中長期分析：重要事項を先に示し、採点根拠は必要時だけ展開する。"""
-    st.subheader("🏢 中長期分析")
-    fundamental = result["fundamental"]
-    total_label = (f'{result["score"]} / 100' if result["score"] is not None else "採点保留")
-    # st.metric の変動値（delta）は矢印SVGを伴うため、評価点はテキストで明示する。
-    # ランク／得点をひと続きに表示し、コピー時の不要な「svg」混入も避ける。
-    st.markdown(f'**中長期適性：{result["grade"]}　｜　{total_label}**')
-    st.write(f'**判定**　{result["grade_text"]}')
-
-    earnings_label = (f'{result["earnings_score"]} / 70点'
-                      if result["earnings_score"] is not None else "採点保留")
-    st.write(f'**業績・会社予想**　{earnings_label}　｜　'
-             f'**長期チャート**　{result["chart_score"]} / 30点')
-
-    # 冒頭は重要な事実だけ。数値は採点時と同じデータから抽出し、再計算しない。
-    components = fundamental.get("components", [])
-    for item in components:
-        if item["label"] in ("前年同期の実績", "通期会社予想と前期実績"):
-            st.write(f'**{item["label"]}**　{item["explanation"]}')
-
-    # 残り期間に必要な利益は採点外だが、会社予想を読むうえで重要なので先頭に表示。
-    notes = fundamental.get("notes", [])
-    required_note = next((note for note in notes
-                          if note.startswith("通期予想達成に残り期間で必要な営業利益：")), None)
-    comparison_note = next((note for note in notes
-                            if note.startswith("残り期間に必要な営業利益の前年同期比：")), None)
-    if required_note:
-        st.info(f"**会社予想の確認ポイント**\n\n{required_note}"
-                + (f"\n\n{comparison_note}" if comparison_note else ""))
-    st.write(f'**長期チャート**　{result["chart_label"]}　｜　'
-             f'約1年騰落率 {result["return240"]:+.1f}%')
-
-    if fundamental["provisional"] and fundamental["score"] is not None:
-        st.warning(f'業績の一部資料が不足しています（採点可能 {fundamental["coverage"]}/70点分）。'
-                   '表示点は暫定値です。')
-    elif fundamental["score"] is None:
-        st.warning("業績資料不足のため、総合点・ランクは表示していません。")
-
-    with st.expander("採点の根拠・業績データを詳しく見る"):
-        # 5年推移は参考情報。スイングにも渡す共通 earnings から参照し、採点式を変更しない。
-        trend = (earnings or {}).get("annual_trend") or {}
-        st.markdown("**過去5年間の通期業績（実績）**")
-        if trend.get("rows"):
-            st.dataframe(pd.DataFrame(trend["rows"]), hide_index=True, use_container_width=True)
-            st.caption("金額は億円。通期の確定実績のみで、会社予想や四半期累計は含みません。")
-            growth = analyze_annual_growth(trend)
-            st.markdown("**長期の売上・利益・収益性の変化（採点対象外）**")
-            for line in growth["lines"]:
-                st.write("・" + line)
-            for note in growth["notes"]:
-                st.caption("・" + note)
-            st.markdown("**営業利益の変動要因（採点対象外）**")
-            profit_change = analyze_profit_change(trend, code=code)
-            st.write(profit_change["summary"])
-            if profit_change["factors"]:
-                st.dataframe(pd.DataFrame([
-                    {"会社資料の要因": name, "営業利益への寄与（億円）": amount}
-                    for name, amount in profit_change["factors"]
-                ]), hide_index=True, use_container_width=True)
-            st.caption(profit_change["note"])
-            if profit_change["source"]:
-                st.markdown(f'[根拠：会社公式の決算説明会資料（PDF）]({profit_change["source"]})')
-        else:
-            st.caption("過去5年間の通期実績は取得できませんでした。")
-        for warning in trend.get("warnings", []):
-            st.caption("注意：" + warning)
-        st.markdown("**業績点の計算内訳**")
-        if components:
-            for item in components:
-                st.write(f'{item["label"]}：{item["score"]} / {item["max"]}点 — {item["explanation"]}')
-            raw_points = sum(item["score"] for item in components)
-            coverage = fundamental["coverage"]
-            if fundamental["score"] is not None:
-                if coverage < 70:
-                    st.caption(f'採点可能な項目 {raw_points}/{coverage}点を70点満点に換算 → '
-                               f'業績 {fundamental["score"]}点（暫定）')
-                else:
-                    st.caption(f'4項目合計 {raw_points}/70点 → 業績 {fundamental["score"]}点')
-        else:
-            st.caption("採点できる業績データがありません。")
-
-        # 冒頭に表示した必要利益・必要増益率は詳細欄では繰り返さない。
-        supplemental_notes = [
-            note for note in notes
-            if not note.startswith((
-                "通期予想達成に残り期間で必要な営業利益：",
-                "残り期間に必要な営業利益の前年同期比：",
-            ))
-            and note != "会社予想は未達の可能性があり、実績とは区別して表示しています。"
-        ]
-        if supplemental_notes:
-            st.markdown("**会社予想・進捗の補足**")
-            for note in supplemental_notes:
-                st.caption(f"・{note}")
-
-        st.markdown("**長期チャートの数値**")
-        st.write(f'6か月騰落率 {result["return120"]:+.1f}%　｜　'
-                 f'約1年騰落率 {result["return240"]:+.1f}%')
-
-        # 古いセッション結果やデータ欠損でも nan を表示しない。
-        def longterm_display(value, suffix="", digits=1):
-            try:
-                number = float(value)
-                return f"{number:.{digits}f}{suffix}" if np.isfinite(number) else "データ不足"
-            except (TypeError, ValueError):
-                return "データ不足"
-
-        position = result.get("range_position")
-        position_text = (longterm_display(float(position) * 100, "%", 0)
-                         if position is not None else "データ不足")
-        st.write(f'約1年の位置 {position_text}　｜　'
-                 f'高値 {longterm_display(result.get("high252"), " 円")}　｜　'
-                 f'安値 {longterm_display(result.get("low252"), " 円")}')
-        if position_text == "データ不足":
-            st.caption("年間高値・安値の有効データが不足しているため、年間位置は採点対象外です。")
-        st.write(f'移動平均線：50日線 {longterm_display(result.get("ma50"))}　｜　'
-                 f'200日線 {longterm_display(result.get("ma200"))}')
-
-    st.caption("中長期専用の参考指標（業績70点・チャート30点）。会社予想は実績と区別し、"
-               "必要利益の比較は採点や達成確率に使用しません。")
 
 
 def show_swing(result, earnings=None):
@@ -2844,9 +1792,8 @@ def show_swing(result, earnings=None):
         for comment in result["comments"]:
             st.write(f"・{comment}")
 
-    # 決算の実額と短期用の業績補正は、スイング欄でだけ確認できるようにする。
-    with st.expander("決算データ・スイング用の業績評価を詳しく見る"):
-        show_earnings_summary(earnings, result.get("data_date"))
+    st.divider()
+    show_earnings_summary(earnings, result.get("data_date"))
 
     st.caption(
         "総合点はテクニカル100点に鮮度調整後の業績補正を加え、"
@@ -2857,13 +1804,7 @@ def show_swing(result, earnings=None):
 # =========================================================
 # メイン画面
 # =========================================================
-st.markdown(
-    '<p style="font-size:1.4rem; font-weight:700; margin:0 0 0.5rem 0; '
-    'white-space:nowrap;">カブグルマン★★★</p>',
-    unsafe_allow_html=True,
-)
-show_morning_market_brief()
-st.divider()
+st.title("🔍 銘柄選定お助けマン")
 
 mode = st.radio(
     "何をしますか？",
@@ -2909,8 +1850,10 @@ if mode == "気になる銘柄を調べる":
 
         code = normalize_code(code_input)
 
-        if not code.isdigit():
-            st.error("銘柄コードは数字で入力してください。")
+        code = code.upper()
+
+        if re.fullmatch(r"[0-9A-Z]{4}", code) is None:
+            st.error("銘柄コードは半角英数字4文字で入力してください（例：6526 / 265A）。")
 
         elif not selected_styles:
             st.warning("投資スタイルを1つ以上選んでください。")
@@ -2931,25 +1874,16 @@ if mode == "気になる銘柄を調べる":
                     company = get_company_name(ticker)
 
                     result = {}
-                    earnings = None
-                    if "swing" in selected_styles or "longterm" in selected_styles:
-                        earnings = fetch_earnings_summary(code)
 
                     if "daytrade" in selected_styles:
-                        result["outlook"] = run_stock_outlook(code)
-                        intraday_adjustment = get_intraday_daytrade_adjustment(code)
-                        result["daytrade"] = analyze_daytrade(
-                            data,
-                            intraday_adjustment=intraday_adjustment,
-                        )
+                        result["daytrade"] = analyze_daytrade(data)
 
                     if "swing" in selected_styles:
                         result["swing"] = analyze_swing(data)
-                        result["swing_earnings"] = earnings
+                        result["swing_earnings"] = fetch_earnings_summary(code)
 
                     if "longterm" in selected_styles:
-                        result["longterm"] = analyze_longterm(data, earnings)
-                        result["longterm_earnings"] = earnings
+                        result["longterm"] = None
 
                     st.session_state.helper_result = result
                     st.session_state.helper_code = code
@@ -2976,12 +1910,7 @@ if mode == "気になる銘柄を調べる":
         st.header(f"{code} {company}")
         st.caption(f"データ日：{data_date}")
 
-        if "outlook" in result:
-            show_stock_outlook(result["outlook"])
-
         if "daytrade" in result:
-            if "outlook" in result:
-                st.divider()
             show_daytrade(result["daytrade"])
 
         if "swing" in result:
@@ -2993,19 +1922,13 @@ if mode == "気になる銘柄を調べる":
 
         if "longterm" in result:
             st.divider()
-            show_longterm(
-                result["longterm"],
-                result.get("longterm_earnings"),
-                code=code,
+            st.subheader("🏢 中長期分析")
+            st.info(
+                "業績・財務・長期チャート・目標株価・"
+                "企業行動パターンなどを順番に実装します。"
             )
-            # 決算データは中長期でも参照可能にする。スイング固有の影響表示だけ省略。
-            # 両方の分析を選択した場合はスイング側の決算詳細を共用し、重複表示しない。
-            if "swing" not in result:
-                with st.expander("🧾 決算データ・短期用の業績評価を見る（中長期採点とは別）"):
-                    show_earnings_summary(
-                        result.get("longterm_earnings"),
-                        show_swing_effect=False,
-                    )
+
+        st.divider()
 
         st.button(
             "🔄 別の銘柄を調べる",
@@ -3021,4 +1944,9 @@ else:
     )
 
 
-st.caption("分析は参考情報であり、投資成果を保証しません。")
+st.divider()
+
+st.caption(
+    "分析結果は売買を保証するものではなく、"
+    "投資判断の参考情報として表示しています。"
+)

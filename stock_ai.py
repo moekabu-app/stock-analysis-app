@@ -1,19 +1,9 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
-
-
-# Streamlit Cloudから呼び出す時は、ExcelやCSVを保存しない。
-# 計算結果の標準出力だけを親アプリへ返す。
-if os.getenv("STOCK_AI_SKIP_EXPORT") == "1":
-    def _skip_export(*args, **kwargs):
-        return None
-
-    pd.DataFrame.to_excel = _skip_export
-    pd.DataFrame.to_csv = _skip_export
+from zoneinfo import ZoneInfo
 
 # =========================================================
 # 基本設定
@@ -135,15 +125,22 @@ def get_market_daily(symbol, name):
 
 
 def get_futures_price():
+    """
+    CME日経225先物(NKD=F)の最新値と、同じ日本時間の日の
+    6:00時点に最も近い直前の5分足を返す。
 
+    カブグルマンの朝の地合いでは、6:00を朝の基準値として、
+    8:30頃なら寄り前の変化、8:56頃なら寄り後の反応を確認する。
+    """
     try:
         df = yf.download(
             "NKD=F",
             period="5d",
-            interval="1h",
+            interval="5m",
             auto_adjust=False,
             progress=False,
-            repair=True
+            repair=True,
+            prepost=True
         )
 
         df = flatten_columns(df)
@@ -152,13 +149,42 @@ def get_futures_price():
             return None
 
         df = df.dropna(subset=["Close"])
-
-        if len(df) == 0:
+        if df.empty:
             return None
 
+        # yfinanceの時刻を日本時間へ統一
+        idx = pd.DatetimeIndex(df.index)
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        idx_jst = idx.tz_convert(ZoneInfo("Asia/Tokyo"))
+        df = df.copy()
+        df.index = idx_jst
+
+        latest_time = df.index[-1]
+        latest_price = float(df["Close"].iloc[-1])
+
+        target_6 = latest_time.normalize() + pd.Timedelta(hours=6)
+        # 6:00を超えない直近の足。日付跨ぎの誤採用を避けるため
+        # 4:30以降のデータに限定する。
+        morning = df[(df.index <= target_6) &
+                     (df.index >= target_6 - pd.Timedelta(minutes=90))]
+
+        if morning.empty:
+            return {
+                "price": latest_price,
+                "date": latest_time,
+                "base_6_price": None,
+                "base_6_time": None
+            }
+
+        base_6_price = float(morning["Close"].iloc[-1])
+        base_6_time = morning.index[-1]
+
         return {
-            "price": float(df["Close"].iloc[-1]),
-            "date": df.index[-1]
+            "price": latest_price,
+            "date": latest_time,
+            "base_6_price": base_6_price,
+            "base_6_time": base_6_time
         }
 
     except Exception:
@@ -170,9 +196,9 @@ def get_futures_price():
 # =========================================================
 code = input(
     "銘柄コードを入力してください: "
-).strip()
+).strip().upper()
 
-if code.upper().endswith(".T"):
+if code.endswith(".T"):
     code = code[:-2]
 
 ticker = code + ".T"
@@ -207,12 +233,21 @@ print("取得銘柄   :", ticker)
 # =========================================================
 # 個別株データ取得
 # =========================================================
+today = datetime.now()
+
+end_date = today + timedelta(days=1)
+start_date = today - timedelta(
+    days=365 * YEARS + 30
+)
+
 data = yf.download(
     ticker,
-    period=f"{YEARS}y",
+    start=start_date.strftime("%Y-%m-%d"),
+    end=end_date.strftime("%Y-%m-%d"),
     interval="1d",
     auto_adjust=False,
-    progress=False
+    progress=False,
+    repair=True
 )
 
 data = flatten_columns(data)
@@ -1466,29 +1501,27 @@ nikkei_futures = get_futures_price()
 
 
 # =========================================================
-# 日経先物と現物の差
+# 日経先物：朝6:00基準の変化率
 # =========================================================
 futures_gap = None
 futures_price = None
+futures_base_6 = None
 
-if (
-    nikkei is not None
-    and
-    nikkei_futures is not None
-):
+if nikkei_futures is not None:
 
-    futures_price = (
-        nikkei_futures["price"]
-    )
+    futures_price = nikkei_futures.get("price")
+    futures_base_6 = nikkei_futures.get("base_6_price")
 
-    futures_gap = (
-        (
-            futures_price
-            - nikkei["close"]
+    if (
+        futures_price is not None
+        and futures_base_6 is not None
+        and futures_base_6 != 0
+    ):
+        futures_gap = (
+            (futures_price - futures_base_6)
+            / futures_base_6
+            * 100
         )
-        / nikkei["close"]
-        * 100
-    )
 
 
 # =========================================================
@@ -2138,16 +2171,13 @@ append_market_row(
 if futures_price is not None:
 
     ground_rows.append({
-        "指標": "日経先物(CME参考)",
+        "指標": "日経先物(CME・6時比)",
         "シンボル": "NKD=F",
         "データ日": str(
             nikkei_futures["date"]
         ),
         "終値": futures_price,
-        "前回値":
-            nikkei["close"]
-            if nikkei is not None
-            else np.nan,
+        "前回値": futures_base_6 if futures_base_6 is not None else np.nan,
         "騰落率": futures_gap
     })
 
@@ -2501,7 +2531,7 @@ if nikkei is not None:
 if futures_gap is not None:
 
     print(
-        f"日経先物(CME)    : "
+        f"日経先物(CME・6時比): "
         f"{futures_gap:+.2f}%"
     )
 
