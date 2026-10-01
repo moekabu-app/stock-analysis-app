@@ -27,7 +27,7 @@ def get_secret_section(section_name):
 
 
 def require_cloud_login():
-    """クラウド公開時だけGoogleログインとメール許可リストを有効にする。"""
+    """クラウド公開時だけパスコード認証を有効にする。"""
     app_settings = get_secret_section("app")
     require_login = bool(app_settings.get("require_login", False))
 
@@ -35,42 +35,43 @@ def require_cloud_login():
     if not require_login:
         return
 
-    auth_settings = get_secret_section("auth")
-    required_auth_keys = (
-        "redirect_uri",
-        "cookie_secret",
-        "client_id",
-        "client_secret",
-        "server_metadata_url",
-    )
+    login_method = str(app_settings.get("login_method", "passcode")).strip().lower()
 
-    if not all(auth_settings.get(key) for key in required_auth_keys):
+    if login_method != "passcode":
+        st.error("ログイン方式が未対応です。Secrets の login_method を passcode にしてください。")
+        st.stop()
+
+    access_passcode = str(app_settings.get("access_passcode", "")).strip()
+
+    if not access_passcode:
         st.error("ログイン設定が不足しているため、アプリを開始できません。")
         st.stop()
 
-    if not st.user.is_logged_in:
+    if "passcode_authenticated" not in st.session_state:
+        st.session_state.passcode_authenticated = False
+
+    if not st.session_state.passcode_authenticated:
         st.title("🔒 銘柄選定お助けマン")
         st.write("このアプリは利用を許可された方専用です。")
-        if st.button("Googleでログイン"):
-            st.login()
+
+        entered_passcode = st.text_input(
+            "パスコード",
+            type="password",
+            key="access_passcode_input",
+        )
+
+        if st.button("ログイン", use_container_width=True):
+            if entered_passcode == access_passcode:
+                st.session_state.passcode_authenticated = True
+                st.rerun()
+            else:
+                st.error("パスコードが違います。")
+
         st.stop()
 
-    user_email = str(st.user.get("email", "")).strip().lower()
-    allowed_emails = {
-        str(email).strip().lower()
-        for email in app_settings.get("allowed_emails", [])
-    }
-
-    if not user_email or user_email not in allowed_emails:
-        st.title("🔒 銘柄選定お助けマン")
-        st.error("このGoogleアカウントには利用許可がありません。")
-        if st.button("ログアウト"):
-            st.logout()
-        st.stop()
-
-    st.sidebar.caption(f"ログイン中：{st.user.get('name', user_email)}")
     if st.sidebar.button("ログアウト"):
-        st.logout()
+        st.session_state.passcode_authenticated = False
+        st.rerun()
 
 
 require_cloud_login()
