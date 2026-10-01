@@ -2004,33 +2004,23 @@ st.caption(
     "日経先物は朝6:00付近の値を基準にします。"
 )
 
-if "morning_pre_result" not in st.session_state:
-    st.session_state.morning_pre_result = None
-if "morning_post_result" not in st.session_state:
-    st.session_state.morning_post_result = None
+# 朝の展望はボタン操作なしで、そのまま2列表示する。
+# 左：8:30寄り前 / 右：8:56寄り後
+with st.spinner("朝の地合いを取得しています..."):
+    morning_pre_result = get_morning_market_outlook()
+    morning_post_result = get_morning_market_outlook()
 
 mc1, mc2 = st.columns(2)
+
 with mc1:
-    if st.button("8:30 寄り前を確認", use_container_width=True):
-        with st.spinner("寄り前の地合いを確認しています..."):
-            st.session_state.morning_pre_result = get_morning_market_outlook()
-
-with mc2:
-    if st.button("8:56 寄り後を確認", use_container_width=True):
-        with st.spinner("寄り後の地合いを確認しています..."):
-            st.session_state.morning_post_result = get_morning_market_outlook()
-
-if st.session_state.morning_pre_result is not None:
     show_morning_outlook_card(
-        st.session_state.morning_pre_result,
+        morning_pre_result,
         "8:30 寄り前展望",
     )
 
-if st.session_state.morning_post_result is not None:
-    if st.session_state.morning_pre_result is not None:
-        st.divider()
+with mc2:
     show_morning_outlook_card(
-        st.session_state.morning_post_result,
+        morning_post_result,
         "8:56 寄り後展望",
     )
 
