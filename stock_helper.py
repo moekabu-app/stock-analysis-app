@@ -6,6 +6,7 @@ import numpy as np
 import os
 import requests
 from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 
 
 # =========================================================
@@ -116,6 +117,196 @@ def normalize_code(code):
 
     return code
 
+
+
+
+def morning_market_score(change):
+    if change is None or pd.isna(change):
+        return 0
+    if change >= 1.0:
+        return 2
+    if change >= 0.30:
+        return 1
+    if change <= -1.0:
+        return -2
+    if change <= -0.30:
+        return -1
+    return 0
+
+
+def get_morning_daily_change(symbol):
+    """朝の地合い用に直近2営業日の終値変化率を取得する。"""
+    try:
+        df = yf.download(
+            symbol,
+            period="10d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            repair=True,
+        )
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if "Close" not in df.columns:
+            return None
+        close = df["Close"].dropna()
+        if len(close) < 2:
+            return None
+        latest = float(close.iloc[-1])
+        previous = float(close.iloc[-2])
+        return {
+            "latest": latest,
+            "previous": previous,
+            "change": (latest - previous) / previous * 100,
+            "time": df.index[-1],
+        }
+    except Exception:
+        return None
+
+
+def get_morning_futures_6am_change():
+    """CME日経先物の最新値を、日本時間6:00直前の5分足と比較する。"""
+    try:
+        df = yf.download(
+            "NKD=F",
+            period="5d",
+            interval="5m",
+            auto_adjust=False,
+            progress=False,
+            repair=True,
+            prepost=True,
+        )
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if "Close" not in df.columns:
+            return None
+        df = df.dropna(subset=["Close"]).copy()
+        if df.empty:
+            return None
+
+        idx = pd.DatetimeIndex(df.index)
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        df.index = idx.tz_convert(ZoneInfo("Asia/Tokyo"))
+
+        latest_time = df.index[-1]
+        latest_price = float(df["Close"].iloc[-1])
+        target_6 = latest_time.normalize() + pd.Timedelta(hours=6)
+        morning = df[
+            (df.index <= target_6)
+            & (df.index >= target_6 - pd.Timedelta(minutes=90))
+        ]
+        if morning.empty:
+            return {
+                "latest": latest_price,
+                "latest_time": latest_time,
+                "base": None,
+                "base_time": None,
+                "change": None,
+            }
+
+        base_price = float(morning["Close"].iloc[-1])
+        base_time = morning.index[-1]
+        change = (latest_price - base_price) / base_price * 100 if base_price else None
+        return {
+            "latest": latest_price,
+            "latest_time": latest_time,
+            "base": base_price,
+            "base_time": base_time,
+            "change": change,
+        }
+    except Exception:
+        return None
+
+
+def get_morning_market_outlook():
+    """8:30寄り前 / 8:56寄り後で共通利用する朝の地合い判定。"""
+    nikkei = get_morning_daily_change("^N225")
+    nasdaq = get_morning_daily_change("^IXIC")
+    sox = get_morning_daily_change("^SOX")
+    kospi = get_morning_daily_change("^KS11")
+    usd_jpy = get_morning_daily_change("JPY=X")
+    futures = get_morning_futures_6am_change()
+
+    futures_change = futures.get("change") if futures else None
+    nikkei_change = nikkei.get("change") if nikkei else None
+
+    if nikkei_change is not None and futures_change is not None:
+        japan_change = nikkei_change * 0.4 + futures_change * 0.6
+    elif nikkei_change is not None:
+        japan_change = nikkei_change
+    else:
+        japan_change = futures_change
+
+    japan_score = morning_market_score(japan_change)
+    nasdaq_score = morning_market_score(nasdaq.get("change") if nasdaq else None)
+    kospi_score = morning_market_score(kospi.get("change") if kospi else None)
+    total_score = japan_score + nasdaq_score + kospi_score
+
+    if total_score >= 4:
+        outlook = "強い追い風"
+    elif total_score >= 2:
+        outlook = "追い風"
+    elif total_score <= -4:
+        outlook = "強い逆風"
+    elif total_score <= -2:
+        outlook = "逆風"
+    else:
+        outlook = "中立"
+
+    return {
+        "outlook": outlook,
+        "score": total_score,
+        "japan_change": japan_change,
+        "nikkei": nikkei,
+        "futures": futures,
+        "nasdaq": nasdaq,
+        "sox": sox,
+        "kospi": kospi,
+        "usd_jpy": usd_jpy,
+        "checked_at": pd.Timestamp.now(tz=ZoneInfo("Asia/Tokyo")),
+    }
+
+
+def show_morning_outlook_card(result, label):
+    if not result:
+        st.warning(f"{label}の地合いデータを取得できませんでした。")
+        return
+
+    checked_at = result["checked_at"].strftime("%H:%M")
+    st.markdown(f"**{label}**　｜　取得 {checked_at}")
+    st.metric("総合地合い", result["outlook"])
+
+    futures = result.get("futures")
+    futures_change = futures.get("change") if futures else None
+    if futures_change is None:
+        st.write("日経先物（6:00比）：取得不可")
+    else:
+        st.write(f"**日経先物（CME・6:00比）**　{futures_change:+.2f}%")
+
+    def pct(item):
+        if not item or item.get("change") is None:
+            return "取得不可"
+        return f"{item['change']:+.2f}%"
+
+    st.write(
+        f"日経平均 {pct(result.get('nikkei'))}　｜　"
+        f"NASDAQ {pct(result.get('nasdaq'))}"
+    )
+    st.write(
+        f"SOX {pct(result.get('sox'))}　｜　"
+        f"KOSPI {pct(result.get('kospi'))}"
+    )
+    usd_jpy = result.get("usd_jpy")
+    if usd_jpy:
+        st.write(
+            f"USD/JPY {usd_jpy['latest']:.2f}　"
+            f"({usd_jpy['change']:+.2f}%)"
+        )
 
 def get_company_name(ticker):
     try:
@@ -1806,6 +1997,44 @@ def show_swing(result, earnings=None):
 # メイン画面
 # =========================================================
 st.title("🔍 銘柄選定お助けマン")
+
+st.markdown("### 🌅 カブグルマン 朝の展望")
+st.caption(
+    "8:30頃は寄り前の地合い確認、8:56頃は寄り後の反応確認。"
+    "日経先物は朝6:00付近の値を基準にします。"
+)
+
+if "morning_pre_result" not in st.session_state:
+    st.session_state.morning_pre_result = None
+if "morning_post_result" not in st.session_state:
+    st.session_state.morning_post_result = None
+
+mc1, mc2 = st.columns(2)
+with mc1:
+    if st.button("8:30 寄り前を確認", use_container_width=True):
+        with st.spinner("寄り前の地合いを確認しています..."):
+            st.session_state.morning_pre_result = get_morning_market_outlook()
+
+with mc2:
+    if st.button("8:56 寄り後を確認", use_container_width=True):
+        with st.spinner("寄り後の地合いを確認しています..."):
+            st.session_state.morning_post_result = get_morning_market_outlook()
+
+if st.session_state.morning_pre_result is not None:
+    show_morning_outlook_card(
+        st.session_state.morning_pre_result,
+        "8:30 寄り前展望",
+    )
+
+if st.session_state.morning_post_result is not None:
+    if st.session_state.morning_pre_result is not None:
+        st.divider()
+    show_morning_outlook_card(
+        st.session_state.morning_post_result,
+        "8:56 寄り後展望",
+    )
+
+st.divider()
 
 mode = st.radio(
     "何をしますか？",
