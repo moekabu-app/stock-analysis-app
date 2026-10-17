@@ -10,9 +10,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 
 # =========================================================
@@ -3664,7 +3666,244 @@ def show_longterm(result, earnings=None, code=None):
                "必要利益の比較は採点や達成確率に使用しません。")
 
 
-def show_swing(result, earnings=None):
+
+def _parse_news_date(value):
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return pd.Timestamp(value, unit="s", tz="UTC").tz_convert("Asia/Tokyo")
+        dt = parsedate_to_datetime(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        return pd.Timestamp(dt).tz_convert("Asia/Tokyo")
+    except Exception:
+        try:
+            ts = pd.Timestamp(value)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            return ts.tz_convert("Asia/Tokyo")
+        except Exception:
+            return None
+
+
+def _clean_news_company_name(company):
+    name = str(company or "").strip()
+    for token in ("株式会社", "（株）", "(株)", "Co., Ltd.", "Ltd."):
+        name = name.replace(token, "")
+    return name.strip()
+
+
+def _assess_stock_news(title, summary=""):
+    """ニュース本文を売買推奨ではなく注意喚起用に簡易分類する。"""
+    text = f"{title} {summary}".lower()
+
+    positive = (
+        "上方修正", "増収", "増益", "黒字転換", "大型受注", "受注", "契約締結", "新規契約",
+        "業務提携", "資本提携", "採用", "増産", "自社株買い", "増配", "補助金", "承認",
+        "order", "contract", "partnership", "deal", "award", "buyback", "dividend increase",
+        "raises forecast", "raised forecast", "approval"
+    )
+    negative = (
+        "下方修正", "減収", "減益", "赤字転落", "赤字拡大", "減産", "契約解除", "破談",
+        "訴訟", "調査", "行政処分", "リコール", "停止", "事故", "規制", "制裁", "情報漏洩",
+        "downgrade", "cuts forecast", "cut forecast", "recall", "lawsuit", "investigation",
+        "suspension", "ban", "sanction", "data breach"
+    )
+    high_impact = (
+        "大型", "大幅", "巨額", "上方修正", "下方修正", "tob", "買収", "合併", "大型受注",
+        "契約締結", "新規契約", "業務提携", "資本提携", "リコール", "訴訟", "行政処分",
+        "工場停止", "生産停止", "contract", "acquisition", "merger", "buyout", "recall"
+    )
+    definitive = (
+        "締結", "発表", "決定", "受注", "採用", "完了", "承認", "成立", "signed", "awarded",
+        "announced", "approved", "completed"
+    )
+    tentative = (
+        "見込み", "予定", "計画", "合意する見込み", "expected", "plans to", "set to", "likely"
+    )
+    uncertain = (
+        "検討", "協議", "観測", "可能性", "報道", "関係者", "rumor", "reportedly", "considering",
+        "talks", "may "
+    )
+
+    pos = sum(1 for k in positive if k in text)
+    neg = sum(1 for k in negative if k in text)
+
+    if pos > neg:
+        direction = "追い風候補"
+    elif neg > pos:
+        direction = "逆風候補"
+    else:
+        direction = "要確認"
+
+    if any(k in text for k in high_impact):
+        impact = "大"
+    elif pos or neg:
+        impact = "中"
+    else:
+        impact = "小"
+
+    if any(k in text for k in uncertain):
+        certainty = "低"
+    elif any(k in text for k in tentative):
+        certainty = "中"
+    elif any(k in text for k in definitive):
+        certainty = "高"
+    else:
+        certainty = "中"
+
+    # 株価への伝わり方を一言で示す。断定はしない。
+    if any(k in text for k in ("契約", "受注", "contract", "order", "deal", "award")):
+        if direction == "追い風候補":
+            influence = "売上・受注増への期待が先行しやすい材料。正式契約や金額の具体化で影響度が変わります。"
+        else:
+            influence = "契約条件や金額が業績にどう効くかを確認したい材料です。"
+    elif any(k in text for k in ("上方修正", "増益", "raises forecast", "raised forecast")):
+        influence = "業績上振れ期待から買い材料として意識されやすい内容です。"
+    elif any(k in text for k in ("下方修正", "減益", "赤字", "cuts forecast", "cut forecast")):
+        influence = "業績悪化懸念から戻り売りや評価低下につながりやすい内容です。"
+    elif any(k in text for k in ("訴訟", "リコール", "停止", "事故", "規制", "制裁", "lawsuit", "recall", "ban", "sanction")):
+        influence = "費用増・事業制約への警戒が出やすく、短期的には売り材料になりやすい内容です。"
+    elif direction == "追い風候補":
+        influence = "期待先行で買い材料として意識される可能性があります。続報と株価反応を確認したい局面です。"
+    elif direction == "逆風候補":
+        influence = "警戒材料として売り圧力につながる可能性があります。株価への織り込み具合を確認したい局面です。"
+    else:
+        influence = "株価への影響方向はまだ明確ではありません。内容と続報を確認したい材料です。"
+
+    return {
+        "direction": direction,
+        "impact": impact,
+        "certainty": certainty,
+        "influence": influence,
+    }
+
+
+def fetch_stock_impact_news(code, company, max_age_days=14):
+    """スイング向けに、直近の株価影響ニュースを注意喚起用として取得する。"""
+    ticker = f"{str(code).strip().upper()}.T"
+    company_clean = _clean_news_company_name(company)
+    items = []
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+        )
+    }
+
+    # 1) Yahoo Finance検索API。銘柄コードに直接ひも付くニュースを優先。
+    try:
+        response = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            params={"q": ticker, "quotesCount": 1, "newsCount": 10},
+            headers=headers,
+            timeout=7,
+        )
+        if response.ok:
+            for row in (response.json().get("news") or []):
+                items.append({
+                    "title": str(row.get("title") or "").strip(),
+                    "summary": str(row.get("summary") or "").strip(),
+                    "url": str(row.get("link") or "").strip(),
+                    "source": str(row.get("publisher") or "Yahoo Finance").strip(),
+                    "published": _parse_news_date(row.get("providerPublishTime")),
+                })
+    except Exception:
+        pass
+
+    # 2) 日本語記事を補うためGoogle News RSS。取得できない場合はYahoo分だけで続行。
+    if company_clean:
+        try:
+            query = quote(f'"{company_clean}" 株')
+            url = f"https://news.google.com/rss/search?q={query}&hl=ja&gl=JP&ceid=JP:ja"
+            response = requests.get(url, headers=headers, timeout=7)
+            if response.ok:
+                root = ET.fromstring(response.content)
+                for node in root.findall(".//item")[:12]:
+                    title = (node.findtext("title") or "").strip()
+                    link = (node.findtext("link") or "").strip()
+                    pub = _parse_news_date(node.findtext("pubDate"))
+                    source_node = node.find("source")
+                    source = (source_node.text or "Google News").strip() if source_node is not None else "Google News"
+                    items.append({
+                        "title": title,
+                        "summary": "",
+                        "url": link,
+                        "source": source,
+                        "published": pub,
+                    })
+        except Exception:
+            pass
+
+    now = pd.Timestamp.now(tz="Asia/Tokyo")
+    deduped = []
+    seen = set()
+    for item in items:
+        title = re.sub(r"\s+", " ", item.get("title") or "").strip()
+        if not title:
+            continue
+        key = re.sub(r"[^0-9a-zA-Zぁ-んァ-ン一-龥]", "", title.lower())[:90]
+        if key in seen:
+            continue
+        seen.add(key)
+
+        published = item.get("published")
+        age_days = None
+        if published is not None:
+            try:
+                age_days = max(0, int((now - published).total_seconds() // 86400))
+            except Exception:
+                age_days = None
+        if age_days is not None and age_days > max_age_days:
+            continue
+
+        assessed = _assess_stock_news(title, item.get("summary") or "")
+        item.update(assessed)
+        item["age_days"] = age_days
+
+        # 注意喚起として意味のあるものだけ残す。方向不明でも影響度大なら表示。
+        if assessed["impact"] in ("大", "中") and (
+            assessed["direction"] != "要確認" or assessed["impact"] == "大"
+        ):
+            deduped.append(item)
+
+    impact_rank = {"大": 2, "中": 1, "小": 0}
+    certainty_rank = {"高": 2, "中": 1, "低": 0}
+    deduped.sort(
+        key=lambda x: (
+            impact_rank.get(x.get("impact"), 0),
+            certainty_rank.get(x.get("certainty"), 0),
+            -(x.get("age_days") if x.get("age_days") is not None else 999),
+        ),
+        reverse=True,
+    )
+
+    return deduped[:3]
+
+
+def _freshness_explanation(adjustment):
+    """数式ではなく、人が読みやすい決算鮮度の説明を返す。"""
+    days = adjustment.get("days_since_disclosure")
+    rate = int(round(float(adjustment.get("freshness_rate", 1.0)) * 100))
+    total = int(adjustment.get("total", 0))
+    raw = int(adjustment.get("raw_total", 0))
+
+    if days is None:
+        return f"業績補正：{total:+d}点（決算日の比較ができないため、最新取得データをそのまま反映）"
+    if days < 0:
+        return "業績補正：0点（株価基準日より後の決算のため、今回の採点には使用していません）"
+    if rate >= 100:
+        return f"業績補正：{total:+d}点（開示から{days}日。最新決算の内容をそのまま反映）"
+
+    return (
+        f"業績補正：{total:+d}点（開示から{days}日。"
+        f"最新の公式決算ですが、時間経過を考慮して影響を{rate}%に抑えて反映）"
+    )
+
+
+def show_swing(result, earnings=None, news=None):
     st.subheader("📊 スイング分析")
     st.caption(f'現在値 {result.get("close", 0):.1f} 円　｜　データ時点 {result.get("data_asof", "-")}')
 
@@ -3688,6 +3927,12 @@ def show_swing(result, earnings=None):
     with c2:
         st.markdown("**判定**")
         st.write(total_grade_text)
+        if news:
+            st.markdown(
+                '<a href="#swing-impact-news" style="text-decoration:none; font-weight:700;">'
+                '⚠ 株価影響ニュースがあります → 内容を見る</a>',
+                unsafe_allow_html=True,
+            )
 
     st.write(
         f'**点数内訳**　テクニカル {technical_score}点　｜　'
@@ -3701,14 +3946,7 @@ def show_swing(result, earnings=None):
             f'予想利益率 {adjustment["margin"]:+d}点　｜　'
             f'前年同期進捗 {adjustment["progress"]:+d}点'
         )
-        days = adjustment["days_since_disclosure"]
-        freshness_pct = adjustment["freshness_rate"] * 100
-        if days is not None:
-            st.write(
-                f'鮮度調整：元 {adjustment["raw_total"]:+d}点 × '
-                f'{freshness_pct:.0f}%（開示から{days}日）'
-                f' → {adjustment["total"]:+d}点'
-            )
+        st.write(_freshness_explanation(adjustment))
         for reason in adjustment["reasons"]:
             st.write(f"・{reason}")
 
@@ -3741,6 +3979,29 @@ def show_swing(result, earnings=None):
     with st.expander("スイング分析のポイント"):
         for comment in result["comments"]:
             st.write(f"・{comment}")
+
+    # 株価に影響しそうなニュースは、点数に混ぜず注意喚起としてだけ表示する。
+    if news:
+        st.markdown('<div id="swing-impact-news"></div>', unsafe_allow_html=True)
+        st.markdown("### 📰 株価影響ニュース")
+        st.caption("ニュースは総合点には加えず、スイング判断で意識したい外部材料として表示します。")
+        for index, item in enumerate(news, start=1):
+            title = item.get("title") or "ニュース"
+            source = item.get("source") or "情報源不明"
+            age_days = item.get("age_days")
+            age_text = f"{age_days}日前" if age_days is not None else "日時不明"
+            st.markdown(f"**{index}. {html.escape(title)}**")
+            st.write(
+                f'材料方向：{item.get("direction", "要確認")}　｜　'
+                f'影響度：{item.get("impact", "-")}　｜　'
+                f'確度：{item.get("certainty", "-")}'
+            )
+            st.write(f'**株価への影響分析：** {item.get("influence", "確認が必要です。")}')
+            st.caption(f"{source}｜{age_text}")
+            if item.get("url"):
+                st.link_button("元記事を見る", item["url"])
+            if index < len(news):
+                st.divider()
 
     # 決算の実額と短期用の業績補正は、スイング欄でだけ確認できるようにする。
     with st.expander("決算データ・スイング用の業績評価を詳しく見る"):
@@ -3847,6 +4108,7 @@ if mode == "気になる銘柄を調べる":
                     if "swing" in selected_styles:
                         result["swing"] = analyze_swing(data, current_snapshot=current_snapshot)
                         result["swing_earnings"] = earnings
+                        result["swing_news"] = fetch_stock_impact_news(code, company)
 
                     if "longterm" in selected_styles:
                         result["longterm"] = analyze_longterm(data, earnings, current_snapshot=current_snapshot)
@@ -3889,7 +4151,8 @@ if mode == "気になる銘柄を調べる":
             st.divider()
             show_swing(
                 result["swing"],
-                result.get("swing_earnings")
+                result.get("swing_earnings"),
+                result.get("swing_news"),
             )
 
         if "longterm" in result:
