@@ -601,74 +601,62 @@ def _morning_card_html(title, brief):
     """
 
 
+def _show_morning_column(title, brief):
+    """朝の展望をStreamlit標準部品だけで表示する。"""
+    st.markdown(f"**{title}**")
+    st.markdown(f"### {brief.get('overall', '中立')}")
+
+    st.write(f"先物6:00比　{_fmt_pct(brief.get('futures_change'))}")
+
+    nikkei_change = (
+        brief.get("nikkei", {}).get("change")
+        if brief.get("nikkei")
+        else None
+    )
+    nasdaq_change = (
+        brief.get("nasdaq", {}).get("change")
+        if brief.get("nasdaq")
+        else None
+    )
+
+    st.write(f"日経　{_fmt_pct(nikkei_change)}")
+    st.write(f"米国　{brief.get('us_tech', '取得不可')} {_fmt_pct(nasdaq_change)}")
+    st.write(f"SOX　{brief.get('sox', '取得不可')}")
+    st.write(f"為替　{brief.get('fx', '取得不可')}")
+
+    status = brief.get("status") or "-"
+    session_date = brief.get("session_date") or "-"
+    st.caption(f"{session_date}｜{status}")
+
+    base_time = brief.get("base_time")
+    target_time_used = brief.get("target_time_used")
+    interval = brief.get("interval") or "-"
+    if base_time is not None and target_time_used is not None:
+        st.caption(
+            f"基準 {base_time.strftime('%H:%M')} → "
+            f"参照 {target_time_used.strftime('%H:%M')}（{interval}足）"
+        )
+
+
 def show_morning_market_brief():
-    """タップ不要。スマホでも8:30と8:56を左右2列で常時表示する。"""
+    """タップ不要。8:30を左、8:56を右に常時表示する。"""
     st.markdown("### 🌅 朝の展望")
 
-    with st.spinner("朝の地合いを取得しています..."):
-        briefs = get_morning_market_briefs()
+    briefs = get_morning_market_briefs()
 
-    st.markdown(
-        """
-        <style>
-        .morning-grid {
-            display: flex;
-            flex-direction: row;
-            gap: 8px;
-            width: 100%;
-            margin-bottom: 0.5rem;
-        }
-        .morning-card {
-            flex: 1 1 0;
-            min-width: 0;
-            border: 1px solid rgba(128,128,128,0.35);
-            border-radius: 10px;
-            padding: 9px 8px;
-            box-sizing: border-box;
-        }
-        .morning-title {
-            font-size: 0.88rem;
-            font-weight: 700;
-            white-space: nowrap;
-            margin-bottom: 3px;
-        }
-        .morning-overall {
-            font-size: 1.05rem;
-            font-weight: 800;
-            margin-bottom: 5px;
-        }
-        .morning-row {
-            font-size: 0.76rem;
-            line-height: 1.35;
-            margin: 2px 0;
-            overflow-wrap: anywhere;
-        }
-        .morning-note {
-            font-size: 0.66rem;
-            opacity: 0.72;
-            line-height: 1.3;
-            margin-top: 4px;
-            overflow-wrap: anywhere;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    left = _morning_card_html("8:30 寄り前", briefs["pre"])
-    right = _morning_card_html("8:56 寄り後", briefs["post"])
-    st.markdown(
-        f'<div class="morning-grid">{left}{right}</div>',
-        unsafe_allow_html=True,
-    )
+    left_col, right_col = st.columns(2, gap="small")
+    with left_col:
+        _show_morning_column("8:30 寄り前", briefs["pre"])
+    with right_col:
+        _show_morning_column("8:56 寄り後", briefs["post"])
 
     if (
         briefs["pre"].get("status") != "取得済み"
         or briefs["post"].get("status") not in ("取得済み", "まだ判定時刻前")
     ):
         st.caption(
-            "取得できない項目がある場合は、Yahoo Finance側の一時的な取得失敗も含め、"
-            "項目ごとに『取得不可』を表示します。アプリ全体は止めません。"
+            "取得できない項目はその項目だけ『取得不可』と表示します。"
+            "画面を覆うエラー表示やデバッグ表示は出しません。"
         )
 
 
