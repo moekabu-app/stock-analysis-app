@@ -3699,7 +3699,7 @@ def _assess_stock_news(title, summary=""):
     text = f"{title} {summary}".lower()
 
     positive = (
-        "上方修正", "増収", "増益", "黒字転換", "大型受注", "受注", "契約締結", "新規契約",
+        "上方修正", "増収", "増益", "黒字転換", "大型受注", "受注", "新規契約",
         "業務提携", "資本提携", "採用", "増産", "自社株買い", "増配", "補助金", "承認",
         "order", "contract", "partnership", "deal", "award", "buyback", "dividend increase",
         "raises forecast", "raised forecast", "approval"
@@ -3711,7 +3711,7 @@ def _assess_stock_news(title, summary=""):
         "suspension", "ban", "sanction", "data breach"
     )
     high_impact = (
-        "大型", "大幅", "巨額", "上方修正", "下方修正", "tob", "買収", "合併", "大型受注",
+        "大型", "大幅", "巨額", "上方修正", "下方修正", "tob", "買収", "合併", "株式交換", "経営統合",
         "契約締結", "新規契約", "業務提携", "資本提携", "リコール", "訴訟", "行政処分",
         "工場停止", "生産停止", "contract", "acquisition", "merger", "buyout", "recall"
     )
@@ -3754,7 +3754,12 @@ def _assess_stock_news(title, summary=""):
         certainty = "中"
 
     # 株価への伝わり方を一言で示す。断定はしない。
-    if any(k in text for k in ("契約", "受注", "contract", "order", "deal", "award")):
+    if any(k in text for k in ("株式交換", "経営統合", "merger", "acquisition", "buyout")):
+        influence = (
+            "資本関係や事業構造が変わる可能性があり、条件次第で株価への影響が大きくなりやすい材料です。"
+            "交換条件・希薄化・業績寄与を確認したい内容です。"
+        )
+    elif any(k in text for k in ("契約", "受注", "contract", "order", "deal", "award")):
         if direction == "追い風候補":
             influence = "売上・受注増への期待が先行しやすい材料。正式契約や金額の具体化で影響度が変わります。"
         else:
@@ -3780,6 +3785,43 @@ def _assess_stock_news(title, summary=""):
     }
 
 
+def _news_search_names(code, company, headers):
+    """ニュース検索用に、取得済み会社名に加えてYahoo日本版の日本語社名も拾う。"""
+    code = str(code).strip().upper()
+    names = []
+
+    company_clean = _clean_news_company_name(company)
+    if company_clean:
+        names.append(company_clean)
+
+    # yfinanceの会社名が英語名になる銘柄向け。Yahoo日本版の<title>から日本語社名を補う。
+    try:
+        response = requests.get(
+            f"https://finance.yahoo.co.jp/quote/{code}.T",
+            headers=headers,
+            timeout=7,
+        )
+        if response.ok:
+            match = re.search(r"<title>\s*([^<【]+)【" + re.escape(code) + r"】", response.text, re.I)
+            if match:
+                jp_name = html.unescape(match.group(1)).strip()
+                jp_name = _clean_news_company_name(jp_name)
+                if jp_name:
+                    names.append(jp_name)
+    except Exception:
+        pass
+
+    # 順序を維持して重複排除。
+    unique = []
+    seen = set()
+    for name in names:
+        key = re.sub(r"\s+", "", str(name)).lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(name)
+    return unique
+
+
 def fetch_stock_impact_news(code, company, max_age_days=14):
     """スイング向けに、直近の株価影響ニュースを注意喚起用として取得する。"""
     ticker = f"{str(code).strip().upper()}.T"
@@ -3793,30 +3835,52 @@ def fetch_stock_impact_news(code, company, max_age_days=14):
         )
     }
 
-    # 1) Yahoo Finance検索API。銘柄コードに直接ひも付くニュースを優先。
-    try:
-        response = requests.get(
-            "https://query1.finance.yahoo.com/v1/finance/search",
-            params={"q": ticker, "quotesCount": 1, "newsCount": 10},
-            headers=headers,
-            timeout=7,
-        )
-        if response.ok:
-            for row in (response.json().get("news") or []):
-                items.append({
-                    "title": str(row.get("title") or "").strip(),
-                    "summary": str(row.get("summary") or "").strip(),
-                    "url": str(row.get("link") or "").strip(),
-                    "source": str(row.get("publisher") or "Yahoo Finance").strip(),
-                    "published": _parse_news_date(row.get("providerPublishTime")),
-                })
-    except Exception:
-        pass
+    search_names = _news_search_names(code, company, headers)
 
-    # 2) 日本語記事を補うためGoogle News RSS。取得できない場合はYahoo分だけで続行。
-    if company_clean:
+    # 1) Yahoo Finance検索API。
+    #    ティッカーだけでなく、銘柄コード・会社名でも探して日本語ニュースの取りこぼしを減らす。
+    yahoo_queries = [ticker, str(code).strip().upper()] + search_names
+    for yahoo_query in yahoo_queries:
+        if not yahoo_query:
+            continue
         try:
-            query = quote(f'"{company_clean}" 株')
+            response = requests.get(
+                "https://query1.finance.yahoo.com/v1/finance/search",
+                params={"q": yahoo_query, "quotesCount": 1, "newsCount": 12},
+                headers=headers,
+                timeout=7,
+            )
+            if response.ok:
+                for row in (response.json().get("news") or []):
+                    items.append({
+                        "title": str(row.get("title") or "").strip(),
+                        "summary": str(row.get("summary") or "").strip(),
+                        "url": str(row.get("link") or "").strip(),
+                        "source": str(row.get("publisher") or "Yahoo Finance").strip(),
+                        "published": _parse_news_date(row.get("providerPublishTime")),
+                    })
+        except Exception:
+            pass
+
+    # 2) Google News RSS。
+    #    yfinanceの英語社名だけに依存せず、日本語社名・銘柄コード・材料語でも複数検索する。
+    google_queries = []
+    for name in search_names:
+        google_queries.append(f'"{name}" 株')
+        google_queries.append(f'"{name}" 契約 OR 提携 OR 受注 OR 買収 OR 株式交換')
+    google_queries.extend([
+        f'"{str(code).strip().upper()}" 株',
+        f'"{str(code).strip().upper()}" 契約 OR 提携 OR 受注 OR 買収 OR 株式交換',
+    ])
+
+    seen_queries = set()
+    for raw_query in google_queries:
+        query_key = raw_query.strip().lower()
+        if not query_key or query_key in seen_queries:
+            continue
+        seen_queries.add(query_key)
+        try:
+            query = quote(raw_query)
             url = f"https://news.google.com/rss/search?q={query}&hl=ja&gl=JP&ceid=JP:ja"
             response = requests.get(url, headers=headers, timeout=7)
             if response.ok:
