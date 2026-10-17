@@ -467,10 +467,53 @@ def _fx_label(usd_jpy):
     return "大きな変化なし"
 
 
-def _build_morning_brief(target_hour, target_minute, daily, futures_pack):
+def _average_market_score(changes):
+    """取得できた指標だけを使って、-2〜+2の平均スコアを返す。"""
+    scores = [
+        morning_score(value)
+        for value in changes
+        if value is not None and not pd.isna(value)
+    ]
+    if not scores:
+        return None
+    return sum(scores) / len(scores)
+
+
+def _weighted_market_score(weighted_changes):
+    """取得できた指標だけで重みを正規化し、-2〜+2のスコアを返す。"""
+    total = 0.0
+    weight_sum = 0.0
+    for value, weight in weighted_changes:
+        if value is None or pd.isna(value):
+            continue
+        total += morning_score(value) * float(weight)
+        weight_sum += float(weight)
+    if weight_sum == 0:
+        return None
+    return total / weight_sum
+
+
+def _market_label_from_average(score):
+    if score is None or pd.isna(score):
+        return "判定保留"
+    if score >= 1.0:
+        return "強い追い風"
+    if score >= 0.35:
+        return "追い風"
+    if score <= -1.0:
+        return "強い逆風"
+    if score <= -0.35:
+        return "逆風"
+    return "中立"
+
+
+def _build_morning_brief(daily, futures_pack):
+    """アプリを開いた時点で取得できる最新データから朝の地合いを作る。"""
     nikkei = daily.get("nikkei")
+    topix = daily.get("topix")
     nasdaq = daily.get("nasdaq")
     sox = daily.get("sox")
+    kospi = daily.get("kospi")
     usd_jpy = daily.get("usd_jpy")
 
     futures_change = None
@@ -488,48 +531,47 @@ def _build_morning_brief(target_hour, target_minute, daily, futures_pack):
         minutes = futures_pack["minutes"]
 
         if not data.empty:
-            latest_time = data.index[-1]
-            session_day = latest_time.normalize()
+            target_time_used = data.index[-1]
+            session_day = target_time_used.normalize()
             session_date = session_day.strftime("%Y-%m-%d")
-            target = session_day + pd.Timedelta(hours=target_hour, minutes=target_minute)
             base_target = session_day + pd.Timedelta(hours=6)
 
-            now_jst = pd.Timestamp.now(tz=ZoneInfo("Asia/Tokyo"))
-            is_latest_today = session_day.date() == now_jst.date()
+            base_price, base_time = _last_completed_price(
+                data, base_target, minutes, lookback_minutes=180
+            )
+            futures_price = float(data["Close"].iloc[-1])
 
-            if is_latest_today and now_jst < target:
-                status = "まだ判定時刻前"
+            if base_price is not None and base_price != 0:
+                futures_change = (futures_price / base_price - 1) * 100
+                status = "取得済み"
             else:
-                # 6:00時点は、6:00までに完了した最後の足を基準にする。
-                base_price, base_time = _last_completed_price(
-                    data, base_target, minutes, lookback_minutes=180
-                )
-                futures_price, target_time_used = _last_completed_price(
-                    data, target, minutes, lookback_minutes=240
-                )
+                status = "6:00基準値を取得できません"
 
-                if base_price is not None and futures_price is not None and base_price != 0:
-                    futures_change = (futures_price / base_price - 1) * 100
-                    status = "取得済み"
-                elif base_price is None:
-                    status = "6:00基準値を取得できません"
-                else:
-                    status = "判定時刻の先物値を取得できません"
+    def change_of(item):
+        return item.get("change") if item else None
 
-    nikkei_change = nikkei.get("change") if nikkei else None
-    if nikkei_change is not None and futures_change is not None:
-        japan_change = nikkei_change * 0.4 + futures_change * 0.6
-    elif nikkei_change is not None:
-        japan_change = nikkei_change
-    else:
-        japan_change = futures_change
+    # 市場全体は、方向性の異なる主要市場を同じ比重で確認する。
+    # 為替は銘柄ごとに意味が変わるので、総合点には入れず別表示にする。
+    overall_score = _average_market_score([
+        futures_change,
+        change_of(nikkei),
+        change_of(topix),
+        change_of(nasdaq),
+        change_of(kospi),
+    ])
 
-    japan_score = morning_score(japan_change)
-    us_score = morning_score(nasdaq.get("change") if nasdaq else None)
-    total_score = japan_score + us_score
+    # 半導体は製作者向けに朝の展望へ常時表示。
+    # SOXを最重視し、NASDAQ・日経先物・KOSPIも補助的に見る。
+    semiconductor_score = _weighted_market_score([
+        (change_of(sox), 0.45),
+        (change_of(nasdaq), 0.20),
+        (futures_change, 0.20),
+        (change_of(kospi), 0.15),
+    ])
 
     return {
-        "overall": morning_label(total_score),
+        "overall": _market_label_from_average(overall_score),
+        "semiconductor": _market_label_from_average(semiconductor_score),
         "futures_change": futures_change,
         "futures_price": futures_price,
         "base_price": base_price,
@@ -538,30 +580,29 @@ def _build_morning_brief(target_hour, target_minute, daily, futures_pack):
         "session_date": session_date,
         "interval": interval,
         "status": status,
-        "us_tech": morning_label(us_score),
-        "sox": morning_label(morning_score(sox.get("change") if sox else None)),
-        "fx": _fx_label(usd_jpy),
         "nikkei": nikkei,
+        "topix": topix,
         "nasdaq": nasdaq,
+        "sox": sox,
+        "kospi": kospi,
         "usd_jpy": usd_jpy,
+        "fx": _fx_label(usd_jpy),
     }
 
 
 @st.cache_data(ttl=180, show_spinner=False)
-def get_morning_market_briefs():
-    """8:30寄り前と8:56寄り後を同じ取得データから作る。"""
+def get_morning_market_brief():
+    """固定時刻ではなく、アクセス時点で取得できる最新値を1回だけ作る。"""
     daily = {
         "nikkei": fetch_market_snapshot("^N225"),
+        "topix": fetch_market_snapshot("^TOPX"),
         "nasdaq": fetch_market_snapshot("^IXIC"),
         "sox": fetch_market_snapshot("^SOX"),
+        "kospi": fetch_market_snapshot("^KS11"),
         "usd_jpy": fetch_market_snapshot("JPY=X"),
     }
     futures_pack = fetch_nikkei_futures_intraday()
-
-    return {
-        "pre": _build_morning_brief(8, 30, daily, futures_pack),
-        "post": _build_morning_brief(8, 56, daily, futures_pack),
-    }
+    return _build_morning_brief(daily, futures_pack)
 
 
 def _fmt_pct(value):
@@ -570,94 +611,61 @@ def _fmt_pct(value):
     return f"{value:+.2f}%"
 
 
-def _morning_card_html(title, brief):
-    date_text = brief.get("session_date") or "-"
-    interval = brief.get("interval") or "-"
-    status = brief.get("status") or "-"
-
-    futures_text = _fmt_pct(brief.get("futures_change"))
-    nikkei_change = brief.get("nikkei", {}).get("change") if brief.get("nikkei") else None
-    nasdaq_change = brief.get("nasdaq", {}).get("change") if brief.get("nasdaq") else None
-
-    detail = ""
-    if brief.get("base_time") is not None and brief.get("target_time_used") is not None:
-        detail = (
-            f"<div class='morning-note'>基準 {brief['base_time'].strftime('%H:%M')}"
-            f" → 参照 {brief['target_time_used'].strftime('%H:%M')}（{interval}足）</div>"
-        )
-
-    return f"""
-    <div class="morning-card">
-      <div class="morning-title">{title}</div>
-      <div class="morning-overall">{brief['overall']}</div>
-      <div class="morning-row"><b>先物6:00比</b> {futures_text}</div>
-      <div class="morning-row"><b>日経</b> {_fmt_pct(nikkei_change)}</div>
-      <div class="morning-row"><b>米国</b> {brief['us_tech']} {_fmt_pct(nasdaq_change)}</div>
-      <div class="morning-row"><b>SOX</b> {brief['sox']}</div>
-      <div class="morning-row"><b>為替</b> {brief['fx']}</div>
-      <div class="morning-note">{date_text}｜{status}</div>
-      {detail}
-    </div>
-    """
-
-
-def _show_morning_column(title, brief):
-    """朝の展望をStreamlit標準部品だけで表示する。"""
-    st.markdown(f"**{title}**")
-    st.markdown(f"### {brief.get('overall', '中立')}")
-
-    st.write(f"先物6:00比　{_fmt_pct(brief.get('futures_change'))}")
-
-    nikkei_change = (
-        brief.get("nikkei", {}).get("change")
-        if brief.get("nikkei")
-        else None
-    )
-    nasdaq_change = (
-        brief.get("nasdaq", {}).get("change")
-        if brief.get("nasdaq")
-        else None
-    )
-
-    st.write(f"日経　{_fmt_pct(nikkei_change)}")
-    st.write(f"米国　{brief.get('us_tech', '取得不可')} {_fmt_pct(nasdaq_change)}")
-    st.write(f"SOX　{brief.get('sox', '取得不可')}")
-    st.write(f"為替　{brief.get('fx', '取得不可')}")
-
-    status = brief.get("status") or "-"
-    session_date = brief.get("session_date") or "-"
-    st.caption(f"{session_date}｜{status}")
-
-    base_time = brief.get("base_time")
-    target_time_used = brief.get("target_time_used")
-    interval = brief.get("interval") or "-"
-    if base_time is not None and target_time_used is not None:
-        st.caption(
-            f"基準 {base_time.strftime('%H:%M')} → "
-            f"参照 {target_time_used.strftime('%H:%M')}（{interval}足）"
-        )
+def _fmt_market_line(label, item):
+    if not item:
+        return f"{label}　取得不可"
+    change = _fmt_pct(item.get("change"))
+    date_text = item.get("date") or "-"
+    return f"{label}　{change}　（{date_text}）"
 
 
 def show_morning_market_brief():
-    """タップ不要。8:30を左、8:56を右に常時表示する。"""
+    """朝の展望は、アクセス時点の最新スナップショットを1段だけ表示する。"""
     st.markdown("### 🌅 朝の展望")
+    brief = get_morning_market_brief()
 
-    briefs = get_morning_market_briefs()
+    target_time = brief.get("target_time_used")
+    if target_time is not None:
+        st.caption(f"最新取得時刻：{target_time.strftime('%Y-%m-%d %H:%M')} JST")
+    else:
+        st.caption("最新取得時刻：先物データ取得不可")
 
-    left_col, right_col = st.columns(2, gap="small")
-    with left_col:
-        _show_morning_column("8:30 寄り前", briefs["pre"])
-    with right_col:
-        _show_morning_column("8:56 寄り後", briefs["post"])
+    st.markdown(f"**市場全体：{brief.get('overall', '判定保留')}**")
+    st.write(f"日経先物（6:00比）　{_fmt_pct(brief.get('futures_change'))}")
+    st.write(_fmt_market_line("日経平均", brief.get("nikkei")))
+    st.write(_fmt_market_line("TOPIX", brief.get("topix")))
+    st.write(_fmt_market_line("NASDAQ", brief.get("nasdaq")))
+    st.write(_fmt_market_line("KOSPI", brief.get("kospi")))
 
-    if (
-        briefs["pre"].get("status") != "取得済み"
-        or briefs["post"].get("status") not in ("取得済み", "まだ判定時刻前")
-    ):
-        st.caption(
-            "取得できない項目はその項目だけ『取得不可』と表示します。"
-            "画面を覆うエラー表示やデバッグ表示は出しません。"
+    usd_jpy = brief.get("usd_jpy")
+    if usd_jpy:
+        usd_price = usd_jpy.get("close")
+        usd_price_text = f"{usd_price:.2f}" if usd_price is not None else "取得不可"
+        st.write(
+            f"USD/JPY　{usd_price_text}　{_fmt_pct(usd_jpy.get('change'))}　"
+            f"（{brief.get('fx', '取得不可')}）"
         )
+    else:
+        st.write("USD/JPY　取得不可")
+
+    st.markdown(f"**半導体地合い：{brief.get('semiconductor', '判定保留')}**")
+    st.write(_fmt_market_line("SOX", brief.get("sox")))
+    st.caption("半導体地合いはSOXを最重視し、NASDAQ・日経先物・KOSPIも加味します。")
+
+    status = brief.get("status") or "-"
+    base_time = brief.get("base_time")
+    interval = brief.get("interval") or "-"
+    if base_time is not None and target_time is not None:
+        st.caption(
+            f"日経先物：基準 {base_time.strftime('%H:%M')} → "
+            f"最新 {target_time.strftime('%H:%M')}（{interval}足）｜{status}"
+        )
+    elif status != "取得済み":
+        st.caption(f"日経先物：{status}")
+
+    st.caption(
+        "個別銘柄分析では、その銘柄に関連するセクター・テーマ別の地合いも確認できるよう対応予定です。"
+    )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
