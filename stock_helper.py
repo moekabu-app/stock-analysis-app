@@ -151,6 +151,11 @@ def reset_analysis():
     st.session_state.stock_code_input = ""
 
 
+def submit_stock_code():
+    """銘柄コード欄でEnterを押した時に、分析ボタンと同じ処理を起動する。"""
+    st.session_state.stock_code_enter_submit = True
+
+
 # =========================================================
 # 株価展望（旧 stock_ai.py をクラウドから呼び出す）
 # =========================================================
@@ -3935,16 +3940,38 @@ def fetch_stock_impact_news(code, company, max_age_days=14):
 
     impact_rank = {"大": 2, "中": 1, "小": 0}
     certainty_rank = {"高": 2, "中": 1, "低": 0}
-    deduped.sort(
-        key=lambda x: (
-            impact_rank.get(x.get("impact"), 0),
-            certainty_rank.get(x.get("certainty"), 0),
-            -(x.get("age_days") if x.get("age_days") is not None else 999),
-        ),
-        reverse=True,
-    )
+    # 注意喚起は「最新の材料」を最優先。同日時なら影響度・確度が高いものを優先。
+    def _news_sort_key(item):
+        published = item.get("published")
+        try:
+            published_value = pd.Timestamp(published).timestamp() if published is not None else 0
+        except Exception:
+            published_value = 0
+        return (
+            published_value,
+            impact_rank.get(item.get("impact"), 0),
+            certainty_rank.get(item.get("certainty"), 0),
+        )
 
-    return deduped[:3]
+    deduped.sort(key=_news_sort_key, reverse=True)
+
+    # スマホで見やすく、既読かどうか日付で判断できるよう最新1件だけ返す。
+    return deduped[:1]
+
+
+def _news_date_text(item):
+    published = (item or {}).get("published")
+    if published is None:
+        return "日付不明"
+    try:
+        ts = pd.Timestamp(published)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC").tz_convert("Asia/Tokyo")
+        else:
+            ts = ts.tz_convert("Asia/Tokyo")
+        return ts.strftime("%Y/%m/%d")
+    except Exception:
+        return "日付不明"
 
 
 def _freshness_explanation(adjustment):
@@ -3992,9 +4019,10 @@ def show_swing(result, earnings=None, news=None):
         st.markdown("**判定**")
         st.write(total_grade_text)
         if news:
+            news_date = _news_date_text(news[0])
             st.markdown(
                 '<a href="#swing-impact-news" style="text-decoration:none; font-weight:700;">'
-                '⚠ 株価影響ニュースがあります → 内容を見る</a>',
+                f'⚠ 株価影響ニュースがあります（{html.escape(news_date)}）→ 内容を見る</a>',
                 unsafe_allow_html=True,
             )
 
@@ -4049,23 +4077,20 @@ def show_swing(result, earnings=None, news=None):
         st.markdown('<div id="swing-impact-news"></div>', unsafe_allow_html=True)
         st.markdown("### 📰 株価影響ニュース")
         st.caption("ニュースは総合点には加えず、スイング判断で意識したい外部材料として表示します。")
-        for index, item in enumerate(news, start=1):
-            title = item.get("title") or "ニュース"
-            source = item.get("source") or "情報源不明"
-            age_days = item.get("age_days")
-            age_text = f"{age_days}日前" if age_days is not None else "日時不明"
-            st.markdown(f"**{index}. {html.escape(title)}**")
-            st.write(
-                f'材料方向：{item.get("direction", "要確認")}　｜　'
-                f'影響度：{item.get("impact", "-")}　｜　'
-                f'確度：{item.get("certainty", "-")}'
-            )
-            st.write(f'**株価への影響分析：** {item.get("influence", "確認が必要です。")}')
-            st.caption(f"{source}｜{age_text}")
-            if item.get("url"):
-                st.link_button("元記事を見る", item["url"])
-            if index < len(news):
-                st.divider()
+        item = news[0]
+        title = item.get("title") or "ニュース"
+        source = item.get("source") or "情報源不明"
+        news_date = _news_date_text(item)
+        st.markdown(f"**{html.escape(news_date)}｜{html.escape(title)}**")
+        st.write(
+            f'材料方向：{item.get("direction", "要確認")}　｜　'
+            f'影響度：{item.get("impact", "-")}　｜　'
+            f'確度：{item.get("certainty", "-")}'
+        )
+        st.write(f'**株価への影響分析：** {item.get("influence", "確認が必要です。")}')
+        st.caption(source)
+        if item.get("url"):
+            st.link_button("元記事を見る", item["url"])
 
     # 決算の実額と短期用の業績補正は、スイング欄でだけ確認できるようにする。
     with st.expander("決算データ・スイング用の業績評価を詳しく見る"):
@@ -4102,7 +4127,8 @@ if mode == "気になる銘柄を調べる":
     code_input = st.text_input(
         "銘柄コード",
         placeholder="例：6526",
-        key="stock_code_input"
+        key="stock_code_input",
+        on_change=submit_stock_code,
     )
 
     st.markdown("### 投資スタイルを選択")
@@ -4127,8 +4153,9 @@ if mode == "気になる銘柄を調べる":
         type="primary",
         use_container_width=True
     )
+    enter_submit = bool(st.session_state.pop("stock_code_enter_submit", False))
 
-    if analyze_button:
+    if analyze_button or enter_submit:
 
         code = normalize_code(code_input)
 
