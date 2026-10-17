@@ -530,6 +530,50 @@ def _fetch_topix_web_fallback():
     except Exception:
         pass
 
+    # 3) Yahoo Japanへ接続できない環境向けにInvesting.comのTOPIXページを試す。
+    try:
+        response = requests.get(
+            "https://jp.investing.com/indices/topix",
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        plain = html.unescape(re.sub(r"<[^>]+>", " ", response.text))
+        plain = plain.replace("％", "%").replace("＋", "+").replace("－", "-").replace("−", "-")
+        plain = re.sub(r"\s+", " ", plain)
+
+        # TOPIX見出し付近にある「4,066.00 +66.66(+1.67%)」型を拾う。
+        match = re.search(
+            r"TOPIX.{0,500}?([\d,]+(?:\.\d+)?)\s+([+\-]?\d[\d,]*(?:\.\d+)?)\s*\(\s*([+\-]?\d+(?:\.\d+)?)\s*%\s*\)",
+            plain,
+            re.IGNORECASE,
+        )
+        if match:
+            close = float(match.group(1).replace(",", ""))
+            change_pct = float(match.group(3))
+            previous = close / (1 + change_pct / 100.0) if change_pct != -100 else None
+            item = make_item(change_pct, close, previous)
+            item["interval"] = "investing-web"
+            item["source"] = "TOPIX"
+            return item
+    except Exception:
+        pass
+
+    # 4) 最終手段。TOPIXそのものが取れない時だけ1306 ETFを参考値として使う。
+    #    画面上ではTOPIX実値と誤認しないよう proxy フラグを付ける。
+    try:
+        proxy = fetch_market_snapshot("1306.T")
+        if proxy is not None:
+            proxy = dict(proxy)
+            proxy["proxy"] = True
+            proxy["source"] = "1306.T"
+            return proxy
+    except Exception:
+        pass
+
     return None
 
 
@@ -617,7 +661,16 @@ def fetch_topix_snapshot():
 
 
 def fetch_stock_snapshot(code):
-    """個別銘柄について、取得できる最新値を優先して返す。"""
+    """
+    個別銘柄について、取得できる最新の「有効な現在値」を返す。
+
+    ルール:
+    - 東証取引時間中は当日の最新イントラデイ値を使う。
+    - 15:30以降・土日・休場日は、確定した最新日足の終値を優先する。
+    - 当日15:30直後など日足更新前だけは、当日の最終イントラデイ値を一時的に使う。
+
+    これにより、休場日に前営業日の1分足終値を「現在値」と誤認しない。
+    """
     symbol = f"{normalize_code(code)}.T"
     try:
         daily = _download_yf(symbol, "10d", "1d", prepost=False, timeout=20)
@@ -626,6 +679,15 @@ def fetch_stock_snapshot(code):
         daily = daily.dropna(subset=["Close"])
         if len(daily) < 2:
             return None
+
+        daily_close = daily["Close"].dropna()
+        daily_last_date = pd.Timestamp(daily_close.index[-1]).date()
+        now_jst = pd.Timestamp.now(tz=ZoneInfo("Asia/Tokyo"))
+        today_jst = now_jst.date()
+        market_day = now_jst.weekday() < 5
+        before_close = (now_jst.hour, now_jst.minute) < (15, 30)
+
+        intraday_item = None
 
         for interval, period in [("1m", "7d"), ("5m", "10d"), ("15m", "30d")]:
             intraday = _download_yf(symbol, period, interval, prepost=False, timeout=20)
@@ -654,11 +716,9 @@ def fetch_stock_snapshot(code):
             low = float(today_rows["Low"].min()) if "Low" in today_rows else close
             volume = float(today_rows["Volume"].fillna(0).sum()) if "Volume" in today_rows else None
 
-            daily_close = daily["Close"].dropna()
-            daily_last_date = pd.Timestamp(daily_close.index[-1]).date()
             previous = float(daily_close.iloc[-2] if daily_last_date == latest_date else daily_close.iloc[-1])
 
-            return {
+            intraday_item = {
                 "symbol": symbol,
                 "close": close,
                 "open": open_,
@@ -673,9 +733,32 @@ def fetch_stock_snapshot(code):
                 "interval": interval,
                 "live": True,
             }
+            break
 
+        # 東証の当日取引中だけイントラデイを「現在値」として採用する。
+        if (
+            intraday_item is not None
+            and market_day
+            and before_close
+            and pd.Timestamp(intraday_item["asof"]).date() == today_jst
+        ):
+            return intraday_item
+
+        # 15:30以降で当日の日足がまだ未反映なら、当日の最終イントラデイを暫定採用。
+        if (
+            intraday_item is not None
+            and market_day
+            and not before_close
+            and pd.Timestamp(intraday_item["asof"]).date() == today_jst
+            and daily_last_date < today_jst
+        ):
+            intraday_item["live"] = False
+            intraday_item["interval"] = intraday_item["interval"] + "-close-wait"
+            return intraday_item
+
+        # 土日・休場日・引け後は、確定した最新日足の終値を使う。
         latest = daily.iloc[-1]
-        previous = float(daily["Close"].iloc[-2])
+        previous = float(daily_close.iloc[-2])
         daily_time = daily.index[-1]
         return {
             "symbol": symbol,
@@ -694,7 +777,6 @@ def fetch_stock_snapshot(code):
         }
     except Exception:
         return None
-
 
 def confirmed_daily_data(data, snapshot=None):
     """移動平均など確定足前提の計算から、場中の未確定日足を除く。"""
@@ -976,7 +1058,9 @@ def show_morning_market_brief():
     st.markdown(f"**市場全体：{brief.get('overall', '判定保留')}**")
     st.write(_fmt_market_line("日経先物", brief.get("futures")))
     st.write(_fmt_market_line("日経平均", brief.get("nikkei")))
-    st.write(_fmt_market_line("TOPIX", brief.get("topix")))
+    topix_item = brief.get("topix")
+    topix_label = "TOPIX参考(1306 ETF)" if topix_item and topix_item.get("proxy") else "TOPIX"
+    st.write(_fmt_market_line(topix_label, topix_item))
     st.write(_fmt_market_line("NASDAQ", brief.get("nasdaq")))
     st.write(_fmt_market_line("KOSPI", brief.get("kospi")))
 
@@ -3211,7 +3295,9 @@ def show_daytrade(result, stock_outlook=None):
             with st.expander("地合いの内訳"):
                 st.write(_fmt_market_line("日経先物", latest_brief.get("futures")))
                 st.write(_fmt_market_line("日経平均", latest_brief.get("nikkei")))
-                st.write(_fmt_market_line("TOPIX", latest_brief.get("topix")))
+                topix_item = latest_brief.get("topix")
+                topix_label = "TOPIX参考(1306 ETF)" if topix_item and topix_item.get("proxy") else "TOPIX"
+                st.write(_fmt_market_line(topix_label, topix_item))
                 st.write(_fmt_market_line("NASDAQ", latest_brief.get("nasdaq")))
                 st.write(_fmt_market_line("SOX", latest_brief.get("sox")))
                 st.write(_fmt_market_line("KOSPI", latest_brief.get("kospi")))
