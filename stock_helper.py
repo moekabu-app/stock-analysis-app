@@ -219,7 +219,7 @@ def parse_stock_outlook(output):
     }
 
 
-def run_stock_outlook(code, stock_data=None):
+def run_stock_outlook(code, stock_data=None, current_snapshot=None):
     script_path = Path(__file__).parent / "stock_ai.py"
     if not script_path.exists():
         return {
@@ -237,6 +237,18 @@ def run_stock_outlook(code, stock_data=None):
                 input_csv = Path(temp_dir) / "stock_outlook_input.csv"
                 stock_data.to_csv(input_csv, encoding="utf-8-sig")
                 environment["STOCK_AI_INPUT_CSV"] = str(input_csv)
+            if current_snapshot:
+                import json
+                serializable = {}
+                for key, value in current_snapshot.items():
+                    if isinstance(value, (pd.Timestamp,)):
+                        serializable[key] = value.isoformat()
+                    else:
+                        try:
+                            serializable[key] = value.item() if hasattr(value, "item") else value
+                        except Exception:
+                            serializable[key] = str(value)
+                environment["STOCK_AI_CURRENT_SNAPSHOT"] = json.dumps(serializable, ensure_ascii=False)
 
             completed = subprocess.run(
                 [sys.executable, str(script_path)],
@@ -406,38 +418,119 @@ def _daily_market_asof(symbol, value):
 
 
 def _fetch_topix_web_fallback():
-    """yfinanceでTOPIXが取れない時だけYahoo!ファイナンス日本版を参照する。"""
+    """yfinanceでTOPIXが取れない時のYahoo!ファイナンス日本版フォールバック。"""
+    # 0) YahooのチャートJSONを直接確認する。
+    try:
+        response = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/998405.T",
+            params={"range": "10d", "interval": "1d", "includePrePost": "true"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result = (((payload or {}).get("chart") or {}).get("result") or [None])[0]
+        if result:
+            timestamps = result.get("timestamp") or []
+            quote = (((result.get("indicators") or {}).get("quote") or [{}])[0])
+            closes = quote.get("close") or []
+            valid = [(ts, c) for ts, c in zip(timestamps, closes) if c is not None]
+            if len(valid) >= 2:
+                (prev_ts, prev), (last_ts, latest) = valid[-2], valid[-1]
+                previous = float(prev)
+                close = float(latest)
+                asof = pd.Timestamp(last_ts, unit="s", tz="UTC").tz_convert(ZoneInfo("Asia/Tokyo"))
+                return {
+                    "close": close,
+                    "previous": previous,
+                    "change": (close / previous - 1) * 100 if previous else None,
+                    "date": asof.strftime("%Y-%m-%d"),
+                    "time": None,
+                    "asof": asof,
+                    "interval": "1d-json",
+                    "symbol": "998405.T",
+                    "live": False,
+                }
+    except Exception:
+        pass
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+    }
+
+    def make_item(change, close=None, previous=None, date_text=None):
+        now_jst = pd.Timestamp.now(tz=ZoneInfo("Asia/Tokyo"))
+        return {
+            "close": close,
+            "previous": previous,
+            "change": change,
+            "date": date_text or now_jst.strftime("%Y-%m-%d"),
+            "time": None,
+            "asof": None,
+            "interval": "web",
+            "symbol": "998405.T",
+            "live": False,
+        }
+
+    # 1) 詳細ページの「前日比 +xx.xx(+x.xx%)」を直接読む。
     try:
         response = requests.get(
             "https://finance.yahoo.co.jp/quote/998405.T",
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=headers,
+            timeout=12,
+        )
+        response.raise_for_status()
+        plain = html.unescape(re.sub(r"<[^>]+>", " ", response.text))
+        plain = plain.replace("％", "%").replace("＋", "+").replace("－", "-").replace("−", "-")
+        plain = re.sub(r"\s+", " ", plain)
+
+        patterns = [
+            r"前日比\s*([+\-]?\d[\d,]*(?:\.\d+)?)\s*\(\s*([+\-]?\d+(?:\.\d+)?)\s*%\s*\)",
+            r"前日比.{0,80}?([+\-]?\d+(?:\.\d+)?)\s*%",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, plain)
+            if match:
+                pct = match.group(2) if match.lastindex and match.lastindex >= 2 else match.group(1)
+                return make_item(float(pct.replace(",", "")))
+    except Exception:
+        pass
+
+    # 2) 詳細ページがブロックされた場合は時系列ページから直近2営業日の終値を読む。
+    try:
+        response = requests.get(
+            "https://finance.yahoo.co.jp/quote/998405.T/history",
+            headers=headers,
             timeout=12,
         )
         response.raise_for_status()
         plain = html.unescape(re.sub(r"<[^>]+>", " ", response.text))
         plain = re.sub(r"\s+", " ", plain)
-        match = re.search(
-            r"前日比\s*([+\-−]?\d[\d,]*(?:\.\d+)?)\s*\(\s*([+\-−]?\d+(?:\.\d+)?)%\s*\)",
-            plain,
+
+        row_pattern = re.compile(
+            r"(20\d{2}/\d{1,2}/\d{1,2})\s+"
+            r"([\d,]+(?:\.\d+)?)\s+"  # 始値
+            r"([\d,]+(?:\.\d+)?)\s+"  # 高値
+            r"([\d,]+(?:\.\d+)?)\s+"  # 安値
+            r"([\d,]+(?:\.\d+)?)"        # 終値
         )
-        if not match:
-            return None
-        change = float(match.group(2).replace("−", "-"))
-        now_jst = pd.Timestamp.now(tz=ZoneInfo("Asia/Tokyo"))
-        # 休場中も直近営業日のTOPIX前日比として利用する。
-        return {
-            "close": None,
-            "previous": None,
-            "change": change,
-            "date": now_jst.strftime("%Y-%m-%d"),
-            "time": None,
-            "asof": None,
-            "interval": "web",
-            "symbol": "998405.T",
-            "live": True,
-        }
+        rows = row_pattern.findall(plain)
+        if len(rows) >= 2:
+            latest_date, _, _, _, latest_close = rows[0]
+            _, _, _, _, previous_close = rows[1]
+            latest = float(latest_close.replace(",", ""))
+            previous = float(previous_close.replace(",", ""))
+            if previous:
+                change = (latest / previous - 1) * 100
+                return make_item(change, latest, previous, latest_date)
     except Exception:
-        return None
+        pass
+
+    return None
 
 
 def fetch_market_snapshot(symbol):
@@ -521,6 +614,132 @@ def fetch_topix_snapshot():
         return item
     return _fetch_topix_web_fallback()
 
+
+
+def fetch_stock_snapshot(code):
+    """個別銘柄について、取得できる最新値を優先して返す。"""
+    symbol = f"{normalize_code(code)}.T"
+    try:
+        daily = _download_yf(symbol, "10d", "1d", prepost=False, timeout=20)
+        if daily is None or "Close" not in daily.columns:
+            return None
+        daily = daily.dropna(subset=["Close"])
+        if len(daily) < 2:
+            return None
+
+        for interval, period in [("1m", "7d"), ("5m", "10d"), ("15m", "30d")]:
+            intraday = _download_yf(symbol, period, interval, prepost=False, timeout=20)
+            if intraday is None or "Close" not in intraday.columns:
+                continue
+            intraday = intraday.dropna(subset=["Close"])
+            if intraday.empty:
+                continue
+
+            idx = pd.DatetimeIndex(intraday.index)
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+            idx_jst = idx.tz_convert(ZoneInfo("Asia/Tokyo"))
+            intraday = intraday.copy()
+            intraday.index = idx_jst
+
+            latest_time = intraday.index[-1]
+            latest_date = latest_time.date()
+            today_rows = intraday[intraday.index.date == latest_date]
+            if today_rows.empty:
+                today_rows = intraday.tail(1)
+
+            close = float(today_rows["Close"].dropna().iloc[-1])
+            open_ = float(today_rows["Open"].dropna().iloc[0]) if "Open" in today_rows else close
+            high = float(today_rows["High"].max()) if "High" in today_rows else close
+            low = float(today_rows["Low"].min()) if "Low" in today_rows else close
+            volume = float(today_rows["Volume"].fillna(0).sum()) if "Volume" in today_rows else None
+
+            daily_close = daily["Close"].dropna()
+            daily_last_date = pd.Timestamp(daily_close.index[-1]).date()
+            previous = float(daily_close.iloc[-2] if daily_last_date == latest_date else daily_close.iloc[-1])
+
+            return {
+                "symbol": symbol,
+                "close": close,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "volume": volume,
+                "previous": previous,
+                "change": (close / previous - 1) * 100 if previous else None,
+                "date": str(latest_date),
+                "time": latest_time,
+                "asof": latest_time,
+                "interval": interval,
+                "live": True,
+            }
+
+        latest = daily.iloc[-1]
+        previous = float(daily["Close"].iloc[-2])
+        daily_time = daily.index[-1]
+        return {
+            "symbol": symbol,
+            "close": float(latest["Close"]),
+            "open": float(latest["Open"]) if "Open" in daily.columns else float(latest["Close"]),
+            "high": float(latest["High"]) if "High" in daily.columns else float(latest["Close"]),
+            "low": float(latest["Low"]) if "Low" in daily.columns else float(latest["Close"]),
+            "volume": float(latest["Volume"]) if "Volume" in daily.columns else None,
+            "previous": previous,
+            "change": (float(latest["Close"]) / previous - 1) * 100 if previous else None,
+            "date": str(pd.Timestamp(daily_time).date()),
+            "time": None,
+            "asof": pd.Timestamp(f"{pd.Timestamp(daily_time).date()} 15:30", tz=ZoneInfo("Asia/Tokyo")),
+            "interval": "1d",
+            "live": False,
+        }
+    except Exception:
+        return None
+
+
+def confirmed_daily_data(data, snapshot=None):
+    """移動平均など確定足前提の計算から、場中の未確定日足を除く。"""
+    df = data.copy()
+    if df.empty or not snapshot or not snapshot.get("live"):
+        return df
+    try:
+        last_date = pd.Timestamp(df.index[-1]).date()
+        snap_date = pd.Timestamp(snapshot.get("asof") or snapshot.get("time")).date()
+        snap_time = pd.Timestamp(snapshot.get("asof") or snapshot.get("time"))
+        if snap_time.tzinfo is None:
+            snap_time = snap_time.tz_localize("UTC").tz_convert(ZoneInfo("Asia/Tokyo"))
+        else:
+            snap_time = snap_time.tz_convert(ZoneInfo("Asia/Tokyo"))
+        # 15:30より前の当日足は未確定として除外する。
+        if last_date == snap_date and (snap_time.hour, snap_time.minute) < (15, 30):
+            df = df.iloc[:-1]
+    except Exception:
+        pass
+    return df
+
+
+def _current_price(snapshot, fallback):
+    try:
+        value = snapshot.get("close") if snapshot else None
+        return float(value) if value is not None and np.isfinite(float(value)) else float(fallback)
+    except Exception:
+        return float(fallback)
+
+
+def _snapshot_asof_text(snapshot, fallback_date=None):
+    if snapshot:
+        value = snapshot.get("asof") or snapshot.get("time")
+        if value is not None:
+            try:
+                ts = pd.Timestamp(value)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                ts = ts.tz_convert(ZoneInfo("Asia/Tokyo"))
+                return ts.strftime("%Y-%m-%d %H:%M JST")
+            except Exception:
+                pass
+        if snapshot.get("date"):
+            return str(snapshot.get("date"))
+    return str(fallback_date or "-")
 
 def morning_score(change):
     if change is None or pd.isna(change):
@@ -859,8 +1078,9 @@ def calculate_atr(data, period=14):
 # =========================================================
 # デイトレ簡易分析
 # =========================================================
-def analyze_daytrade(data, intraday_adjustment=0):
-    df = data.copy()
+def analyze_daytrade(data, intraday_adjustment=0, current_snapshot=None):
+    # MA/ATR/過去統計は最新の確定日足、現在値・現在位置は取得できる最新値を使う。
+    df = confirmed_daily_data(data, current_snapshot)
 
     df["MA5"] = df["Close"].rolling(5).mean()
     df["MA25"] = df["Close"].rolling(25).mean()
@@ -876,7 +1096,8 @@ def analyze_daytrade(data, intraday_adjustment=0):
     latest = df.iloc[-1]
     previous = df.iloc[-2]
 
-    close = float(latest["Close"])
+    confirmed_close = float(latest["Close"])
+    close = _current_price(current_snapshot, confirmed_close)
     ma5 = float(latest["MA5"])
     ma25 = float(latest["MA25"])
     atr14 = float(latest["ATR14"])
@@ -885,9 +1106,9 @@ def analyze_daytrade(data, intraday_adjustment=0):
     turnover20 = float(latest["Turnover20"])
     high20 = float(latest["High20"])
     low20 = float(latest["Low20"])
-    prev_close = float(previous["Close"])
-    prev_high = float(previous["High"])
-    prev_low = float(previous["Low"])
+    prev_close = float(latest["Close"])
+    prev_high = float(latest["High"])
+    prev_low = float(latest["Low"])
 
     atr_pct = atr14 / close * 100 if close > 0 else 0
     volume_ratio = volume / volume20 if volume20 > 0 else 0
@@ -1059,6 +1280,8 @@ def analyze_daytrade(data, intraday_adjustment=0):
         "grade": grade,
         "grade_text": grade_text,
         "close": close,
+        "confirmed_close": confirmed_close,
+        "data_asof": _snapshot_asof_text(current_snapshot, pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d")),
         "turnover_oku": turnover_oku,
         "atr_pct": atr_pct,
         "volume_ratio": volume_ratio,
@@ -1082,8 +1305,9 @@ def analyze_daytrade(data, intraday_adjustment=0):
 # =========================================================
 # スイング分析
 # =========================================================
-def analyze_swing(data):
-    df = data.copy()
+def analyze_swing(data, current_snapshot=None):
+    # MA/ATR/出来高などは確定日足、現在位置・騰落率は最新値を使用。
+    df = confirmed_daily_data(data, current_snapshot)
 
     df["MA5"] = df["Close"].rolling(5).mean()
     df["MA25"] = df["Close"].rolling(25).mean()
@@ -1099,7 +1323,8 @@ def analyze_swing(data):
 
     latest = df.iloc[-1]
 
-    close = float(latest["Close"])
+    confirmed_close = float(latest["Close"])
+    close = _current_price(current_snapshot, confirmed_close)
     ma5 = float(latest["MA5"])
     ma25 = float(latest["MA25"])
     ma75 = float(latest["MA75"])
@@ -1296,6 +1521,8 @@ def analyze_swing(data):
         "grade": grade,
         "grade_text": grade_text,
         "close": close,
+        "confirmed_close": confirmed_close,
+        "data_asof": _snapshot_asof_text(current_snapshot, pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d")),
         "trend": trend_label,
         "position": position_label,
         "return20": return20,
@@ -1311,7 +1538,11 @@ def analyze_swing(data):
         "resistance": resistance,
         "high60": high60,
         "low60": low60,
-        "data_date": pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d"),
+        "data_date": (
+            str(current_snapshot.get("date"))
+            if current_snapshot and current_snapshot.get("date")
+            else pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d")
+        ),
         "comments": comments
     }
 
@@ -1469,14 +1700,16 @@ def score_longterm_fundamentals(earnings, price_date=None):
 # =========================================================
 # 中長期分析
 # =========================================================
-def analyze_longterm(data, earnings=None):
+def analyze_longterm(data, earnings=None, current_snapshot=None):
     """業績と約1年の株価位置から、中長期の保有候補としての強さを見る。"""
-    df = data.copy()
+    # 長期MAは確定日足、現在株価・現在位置は取得できる最新値を使う。
+    df = confirmed_daily_data(data, current_snapshot)
     df["MA50"] = df["Close"].rolling(50).mean()
     df["MA200"] = df["Close"].rolling(200).mean()
 
     latest = df.iloc[-1]
-    close = float(latest["Close"])
+    confirmed_close = float(latest["Close"])
+    close = _current_price(current_snapshot, confirmed_close)
     ma50 = float(latest["MA50"])
     ma200 = float(latest["MA200"])
     # 取得本数が252営業日にわずかに届かない場合でも、
@@ -1487,6 +1720,16 @@ def analyze_longterm(data, earnings=None):
     yearly_lows = pd.to_numeric(yearly_data["Low"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     high252 = float(yearly_highs.max()) if not yearly_highs.empty else float("nan")
     low252 = float(yearly_lows.min()) if not yearly_lows.empty else float("nan")
+    if current_snapshot:
+        try:
+            current_high = float(current_snapshot.get("high"))
+            current_low = float(current_snapshot.get("low"))
+            if np.isfinite(current_high):
+                high252 = max(high252, current_high) if np.isfinite(high252) else current_high
+            if np.isfinite(current_low):
+                low252 = min(low252, current_low) if np.isfinite(low252) else current_low
+        except Exception:
+            pass
 
     return120 = (close / float(df["Close"].iloc[-121]) - 1) * 100 if len(df) >= 121 else 0
     return240 = (close / float(df["Close"].iloc[-241]) - 1) * 100 if len(df) >= 241 else 0
@@ -1520,8 +1763,9 @@ def analyze_longterm(data, earnings=None):
         chart_label = "長期は転換・調整局面"
 
     # 中長期専用の業績採点。スイング向けの決算鮮度補正は使わない。
+    analysis_date = pd.Timestamp.now(tz=ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
     fundamental = score_longterm_fundamentals(
-        earnings, pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d")
+        earnings, analysis_date
     )
     earnings_score = fundamental["score"]
     total = min(100, chart_score + earnings_score) if earnings_score is not None else None
@@ -1540,6 +1784,9 @@ def analyze_longterm(data, earnings=None):
     return {
         "score": total,
         "grade": grade,
+        "close": close,
+        "confirmed_close": confirmed_close,
+        "data_asof": _snapshot_asof_text(current_snapshot, pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d")),
         "grade_text": grade_text,
         "chart_score": chart_score,
         "earnings_score": earnings_score,
@@ -2869,8 +3116,49 @@ def show_stock_outlook(result):
         st.text(result["detail"])
 
 
+def _latest_market_detail_text(detail, brief):
+    """stock_aiの古い日足地合い表示を、朝の最新スナップショット表示へ差し替える。"""
+    if not detail:
+        return detail
+
+    lines = detail.splitlines()
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if "今日の地合い" in line:
+            start = i
+            continue
+        if start is not None and i > start and "類似局面の統計" in line:
+            end = i
+            break
+
+    if start is None:
+        return detail
+    if end is None:
+        end = len(lines)
+
+    latest_lines = [
+        "======================================",
+        "           今日の地合い（最新）",
+        "======================================",
+        f"市場全体         : {brief.get('overall', '判定保留')}",
+        f"日経先物         : {_fmt_pct((brief.get('futures') or {}).get('change'))}",
+        f"日経平均         : {_fmt_pct((brief.get('nikkei') or {}).get('change'))}",
+        f"TOPIX            : {_fmt_pct((brief.get('topix') or {}).get('change'))}",
+        f"NASDAQ           : {_fmt_pct((brief.get('nasdaq') or {}).get('change'))}",
+        f"SOX              : {_fmt_pct((brief.get('sox') or {}).get('change'))}",
+        f"KOSPI            : {_fmt_pct((brief.get('kospi') or {}).get('change'))}",
+        f"USD/JPY          : {_fmt_pct((brief.get('usd_jpy') or {}).get('change'))}",
+        f"為替環境         : {brief.get('fx', '取得不可')}",
+        f"半導体地合い     : {brief.get('semiconductor', '判定保留')}",
+        "",
+    ]
+    return "\n".join(lines[:start] + latest_lines + lines[end:])
+
+
 def show_daytrade(result, stock_outlook=None):
     st.subheader("☀️ 今日のデイトレ展望")
+    st.caption(f'現在値 {result.get("close", 0):.1f} 円　｜　データ時点 {result.get("data_asof", "-")}')
 
     # 「今日の株価展望」で使っていた情報は削除せず、
     # デイトレ展望の中へ整理統合して表示する。
@@ -2884,11 +3172,14 @@ def show_daytrade(result, stock_outlook=None):
             st.markdown("**全体の方向性**")
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.metric("方向性", stock_outlook.get("direction", "-"))
+                st.caption("方向性")
+                st.write(stock_outlook.get("direction", "-"))
             with c2:
-                st.metric("値動き", stock_outlook.get("volatility", "-"))
+                st.caption("値動き")
+                st.write(stock_outlook.get("volatility", "-"))
             with c3:
-                st.metric("信頼度", stock_outlook.get("confidence", "-"))
+                st.caption("信頼度")
+                st.write(stock_outlook.get("confidence", "-"))
 
             zones = stock_outlook.get("zones") or {}
             up = zones.get("up") or {}
@@ -2930,7 +3221,11 @@ def show_daytrade(result, stock_outlook=None):
                 st.caption(stock_outlook["warning"])
 
             with st.expander("類似局面・展望の詳しい分析を見る"):
-                st.text(stock_outlook.get("detail", "詳細データはありません。"))
+                latest_detail = _latest_market_detail_text(
+                    stock_outlook.get("detail", "詳細データはありません。"),
+                    latest_brief,
+                )
+                st.text(latest_detail)
 
             st.divider()
 
@@ -3038,6 +3333,7 @@ def analyze_profit_change(trend, code=None):
 def show_longterm(result, earnings=None, code=None):
     """中長期分析：重要事項を先に示し、採点根拠は必要時だけ展開する。"""
     st.subheader("🏢 中長期分析")
+    st.caption(f'現在値 {result.get("close", 0):.1f} 円　｜　株価データ時点 {result.get("data_asof", "-")}')
     fundamental = result["fundamental"]
     total_label = (f'{result["score"]} / 100' if result["score"] is not None else "採点保留")
     # st.metric の変動値（delta）は矢印SVGを伴うため、評価点はテキストで明示する。
@@ -3160,6 +3456,7 @@ def show_longterm(result, earnings=None, code=None):
 
 def show_swing(result, earnings=None):
     st.subheader("📊 スイング分析")
+    st.caption(f'現在値 {result.get("close", 0):.1f} 円　｜　データ時点 {result.get("data_asof", "-")}')
 
     adjustment = calculate_earnings_adjustment(
         earnings,
@@ -3319,6 +3616,8 @@ if mode == "気になる銘柄を調べる":
                 else:
                     ticker = f"{code}.T"
                     company = get_company_name(ticker)
+                    current_snapshot = fetch_stock_snapshot(code)
+                    confirmed_data = confirmed_daily_data(data, current_snapshot)
 
                     result = {}
                     earnings = None
@@ -3326,26 +3625,29 @@ if mode == "気になる銘柄を調べる":
                         earnings = fetch_earnings_summary(code)
 
                     if "daytrade" in selected_styles:
-                        result["outlook"] = run_stock_outlook(code, data)
+                        result["outlook"] = run_stock_outlook(code, confirmed_data, current_snapshot=current_snapshot)
                         intraday_adjustment = get_intraday_daytrade_adjustment(code)
                         result["daytrade"] = analyze_daytrade(
                             data,
                             intraday_adjustment=intraday_adjustment,
+                            current_snapshot=current_snapshot,
                         )
 
                     if "swing" in selected_styles:
-                        result["swing"] = analyze_swing(data)
+                        result["swing"] = analyze_swing(data, current_snapshot=current_snapshot)
                         result["swing_earnings"] = earnings
 
                     if "longterm" in selected_styles:
-                        result["longterm"] = analyze_longterm(data, earnings)
+                        result["longterm"] = analyze_longterm(data, earnings, current_snapshot=current_snapshot)
                         result["longterm_earnings"] = earnings
 
                     st.session_state.helper_result = result
                     st.session_state.helper_code = code
                     st.session_state.helper_company = company
                     st.session_state.helper_date = (
-                        pd.Timestamp(data.index[-1]).strftime("%Y-%m-%d")
+                        str((current_snapshot or {}).get("date"))
+                        if current_snapshot and current_snapshot.get("date")
+                        else pd.Timestamp(data.index[-1]).strftime("%Y-%m-%d")
                     )
                     st.session_state.helper_styles = selected_styles
 

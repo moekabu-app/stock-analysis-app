@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import os
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -459,10 +460,21 @@ data["翌日GU_GD率"] = (
 # =========================================================
 # 最新値
 # =========================================================
-latest = data.iloc[-1]
+# 移動平均・ATR・過去統計は確定日足を基準にし、
+# helperから最新スナップショットが渡された場合は現在値だけ最新化する。
+latest = data.iloc[-1].copy()
 latest_date = data.index[-1]
 
-close_price = float(latest["Close"])
+current_snapshot = None
+snapshot_json = os.environ.get("STOCK_AI_CURRENT_SNAPSHOT", "").strip()
+if snapshot_json:
+    try:
+        current_snapshot = json.loads(snapshot_json)
+    except Exception:
+        current_snapshot = None
+
+confirmed_close = float(latest["Close"])
+close_price = confirmed_close
 high_price = float(latest["High"])
 low_price = float(latest["Low"])
 
@@ -472,29 +484,56 @@ ma25 = float(latest["25日移動平均"])
 rsi = float(latest["RSI"])
 atr = float(latest["ATR14"])
 
-volume_ratio = float(
-    latest["出来高倍率"]
-)
+volume_ratio = float(latest["出来高倍率"])
+
+if current_snapshot:
+    try:
+        close_price = float(current_snapshot.get("close", close_price))
+        high_price = float(current_snapshot.get("high", high_price))
+        low_price = float(current_snapshot.get("low", low_price))
+        if current_snapshot.get("date"):
+            latest_date = pd.Timestamp(current_snapshot.get("date"))
+
+        # 現在値を使った暫定テクニカル。MA/ATR本体は確定足の値を維持する。
+        latest["5日乖離率"] = (close_price - ma5) / ma5 * 100 if ma5 else latest["5日乖離率"]
+        latest["25日乖離率"] = (close_price - ma25) / ma25 * 100 if ma25 else latest["25日乖離率"]
+        latest["ATR率"] = atr / close_price * 100 if close_price else latest["ATR率"]
+        latest["当日騰落率"] = (close_price / confirmed_close - 1) * 100 if confirmed_close else 0.0
+
+        # RSIは「確定足 + 現在値」で暫定更新する。
+        live_closes = pd.concat([
+            data["Close"].astype(float),
+            pd.Series([close_price], index=[latest_date])
+        ])
+        live_delta = live_closes.diff()
+        live_gain = live_delta.clip(lower=0)
+        live_loss = -live_delta.clip(upper=0)
+        live_avg_gain = live_gain.rolling(14).mean().iloc[-1]
+        live_avg_loss = live_loss.rolling(14).mean().iloc[-1]
+        if pd.notna(live_avg_gain) and pd.notna(live_avg_loss):
+            if live_avg_loss == 0:
+                rsi = 100.0
+            else:
+                live_rs = live_avg_gain / live_avg_loss
+                rsi = 100 - 100 / (1 + live_rs)
+            latest["RSI"] = rsi
+    except Exception:
+        pass
 
 
 # =========================================================
 # 高値安値
 # =========================================================
-five_day_high = float(
-    data["High"].iloc[-5:].max()
-)
+five_day_high = float(data["High"].iloc[-5:].max())
+five_day_low = float(data["Low"].iloc[-5:].min())
+twenty_day_high = float(data["High"].iloc[-20:].max())
+twenty_day_low = float(data["Low"].iloc[-20:].min())
 
-five_day_low = float(
-    data["Low"].iloc[-5:].min()
-)
-
-twenty_day_high = float(
-    data["High"].iloc[-20:].max()
-)
-
-twenty_day_low = float(
-    data["Low"].iloc[-20:].min()
-)
+if current_snapshot:
+    five_day_high = max(five_day_high, high_price)
+    five_day_low = min(five_day_low, low_price)
+    twenty_day_high = max(twenty_day_high, high_price)
+    twenty_day_low = min(twenty_day_low, low_price)
 
 
 # =========================================================
@@ -511,7 +550,7 @@ features = [
     "当日騰落率"
 ]
 
-history = data.iloc[:-1].copy()
+history = data.copy() if current_snapshot else data.iloc[:-1].copy()
 
 history = history.dropna(
     subset=features + [
@@ -2223,7 +2262,7 @@ print(
 )
 
 print(
-    f"前日終値      : "
+    f"現在値        : "
     f"{close_price:.2f} 円"
 )
 
