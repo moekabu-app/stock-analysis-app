@@ -1,6 +1,7 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -240,17 +241,29 @@ start_date = today - timedelta(
     days=365 * YEARS + 30
 )
 
-data = yf.download(
-    ticker,
-    start=start_date.strftime("%Y-%m-%d"),
-    end=end_date.strftime("%Y-%m-%d"),
-    interval="1d",
-    auto_adjust=False,
-    progress=False,
-    repair=True
-)
+input_csv = os.environ.get("STOCK_AI_INPUT_CSV", "").strip()
 
-data = flatten_columns(data)
+if input_csv and Path(input_csv).exists():
+    try:
+        data = pd.read_csv(
+            input_csv,
+            index_col=0,
+            parse_dates=True,
+        )
+        data = flatten_columns(data)
+    except Exception:
+        data = pd.DataFrame()
+else:
+    data = yf.download(
+        ticker,
+        start=start_date.strftime("%Y-%m-%d"),
+        end=end_date.strftime("%Y-%m-%d"),
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        repair=True
+    )
+    data = flatten_columns(data)
 
 if data.empty:
     print("\n株価データを取得できませんでした。")

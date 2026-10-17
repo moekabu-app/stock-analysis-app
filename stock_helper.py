@@ -218,7 +218,7 @@ def parse_stock_outlook(output):
     }
 
 
-def run_stock_outlook(code):
+def run_stock_outlook(code, stock_data=None):
     script_path = Path(__file__).parent / "stock_ai.py"
     if not script_path.exists():
         return {
@@ -229,6 +229,14 @@ def run_stock_outlook(code):
     environment["STOCK_AI_SKIP_EXPORT"] = "1"
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
+            # 個別銘柄の株価は helper 側ですでに取得済み。
+            # 同じYahooデータを stock_ai.py が取り直さないよう、
+            # 一時CSVで受け渡して二重取得を防ぐ。
+            if stock_data is not None and not stock_data.empty:
+                input_csv = Path(temp_dir) / "stock_outlook_input.csv"
+                stock_data.to_csv(input_csv, encoding="utf-8-sig")
+                environment["STOCK_AI_INPUT_CSV"] = str(input_csv)
+
             completed = subprocess.run(
                 [sys.executable, str(script_path)],
                 # 最初は銘柄コード、最後は旧プログラムの終了確認用Enter。
@@ -291,7 +299,7 @@ def download_stock_data(code):
 
     data = yf.download(
         ticker,
-        period="1y",
+        period="5y",
         interval="1d",
         auto_adjust=False,
         progress=False
@@ -597,17 +605,11 @@ def _fmt_price(value):
 
 
 def _fmt_market_line(label, item):
+    """朝の展望はコンパクトに、前日比％だけを表示する。"""
     if not item:
         return f"{label}　取得不可"
-    price = _fmt_price(item.get("close"))
     change = _fmt_pct(item.get("change"))
-    time_value = item.get("time")
-    if time_value is not None:
-        time_text = time_value.strftime("%m/%d %H:%M")
-    else:
-        time_text = item.get("date") or "-"
-    interval = item.get("interval") or "-"
-    return f"{label}　{price}　{change}　（{time_text} / {interval}）"
+    return f"{label}　{change}"
 
 
 def show_morning_market_brief():
@@ -3189,7 +3191,7 @@ if mode == "気になる銘柄を調べる":
                         earnings = fetch_earnings_summary(code)
 
                     if "daytrade" in selected_styles:
-                        result["outlook"] = run_stock_outlook(code)
+                        result["outlook"] = run_stock_outlook(code, data)
                         intraday_adjustment = get_intraday_daytrade_adjustment(code)
                         result["daytrade"] = analyze_daytrade(
                             data,
