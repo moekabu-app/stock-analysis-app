@@ -356,78 +356,96 @@ def _download_yf(symbol, period, interval, prepost=False, timeout=20):
     return data
 
 
-def fetch_market_snapshot(symbol):
-    """朝の地合い用に直近2本の日足終値と騰落率を取得する。"""
+def _as_market_symbols(symbol):
+    """単一シンボル/候補シンボルのどちらでも扱えるようにする。"""
+    if isinstance(symbol, (list, tuple)):
+        return list(symbol)
+    return [symbol]
+
+
+def _timestamp_to_jst(value):
+    """取得時刻を表示用のJSTへ変換する。"""
+    if value is None:
+        return None
     try:
-        data = _download_yf(symbol, "10d", "1d", prepost=False, timeout=20)
-        if data is None or "Close" not in data.columns:
-            return None
-
-        close = data["Close"].dropna()
-        if len(close) < 2:
-            return None
-
-        latest = float(close.iloc[-1])
-        previous = float(close.iloc[-2])
-        return {
-            "close": latest,
-            "previous": previous,
-            "change": (latest / previous - 1) * 100 if previous else None,
-            "date": str(close.index[-1])[:10],
-        }
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert(ZoneInfo("Asia/Tokyo"))
     except Exception:
         return None
 
 
-def fetch_nikkei_futures_intraday():
-    """CME日経先物の朝の時刻比較用データを取得する。細かい足から順に試す。"""
-    attempts = [
-        ("1m", "7d", 1),
-        ("5m", "10d", 5),
-        ("15m", "10d", 15),
-        ("1h", "10d", 60),
-    ]
+def fetch_market_snapshot(symbol):
+    """
+    朝の地合い用。
+    まず1分足→5分足→15分足の順で、その時点で取得できる最新値を探す。
+    騰落率は「最新値 ÷ 前営業日終値 - 1」で計算する。
+    イントラデイが取れない場合だけ日足へフォールバックする。
+    """
+    symbols = _as_market_symbols(symbol)
 
-    for interval, period, minutes in attempts:
+    for active_symbol in symbols:
         try:
-            data = _download_yf(
-                "NKD=F",
-                period,
-                interval,
-                prepost=True,
-                timeout=20,
-            )
-            if data is None or "Close" not in data.columns:
+            daily = _download_yf(active_symbol, "10d", "1d", prepost=False, timeout=20)
+            if daily is None or "Close" not in daily.columns:
+                continue
+            daily_close = daily["Close"].dropna()
+            if len(daily_close) < 2:
                 continue
 
-            data = data.dropna(subset=["Close"]).copy()
-            if data.empty:
-                continue
+            intraday = None
+            used_interval = None
+            for interval, period in [("1m", "7d"), ("5m", "10d"), ("15m", "30d")]:
+                intraday = _download_yf(active_symbol, period, interval, prepost=True, timeout=20)
+                if intraday is not None and "Close" in intraday.columns and not intraday["Close"].dropna().empty:
+                    used_interval = interval
+                    break
+                intraday = None
 
-            idx = pd.DatetimeIndex(data.index)
-            if idx.tz is None:
-                idx = idx.tz_localize("UTC")
-            data.index = idx.tz_convert(ZoneInfo("Asia/Tokyo"))
+            if intraday is not None:
+                close = intraday["Close"].dropna()
+                latest = float(close.iloc[-1])
+                latest_raw_time = close.index[-1]
+                try:
+                    intraday_date = pd.Timestamp(latest_raw_time).date()
+                    daily_last_date = pd.Timestamp(daily_close.index[-1]).date()
+                except Exception:
+                    intraday_date = None
+                    daily_last_date = None
 
+                if intraday_date is not None and intraday_date == daily_last_date:
+                    previous = float(daily_close.iloc[-2])
+                else:
+                    previous = float(daily_close.iloc[-1])
+
+                return {
+                    "close": latest,
+                    "previous": previous,
+                    "change": (latest / previous - 1) * 100 if previous else None,
+                    "date": str(intraday_date) if intraday_date else str(latest_raw_time)[:10],
+                    "time": _timestamp_to_jst(latest_raw_time),
+                    "interval": used_interval,
+                    "symbol": active_symbol,
+                    "live": True,
+                }
+
+            latest = float(daily_close.iloc[-1])
+            previous = float(daily_close.iloc[-2])
+            daily_time = daily_close.index[-1]
             return {
-                "data": data,
-                "interval": interval,
-                "minutes": minutes,
+                "close": latest,
+                "previous": previous,
+                "change": (latest / previous - 1) * 100 if previous else None,
+                "date": str(daily_time)[:10],
+                "time": None,
+                "interval": "1d",
+                "symbol": active_symbol,
+                "live": False,
             }
         except Exception:
             continue
-
     return None
-
-
-def _last_completed_price(data, target, interval_minutes, lookback_minutes=180):
-    """target時刻までに完了している最後の足の終値を返す。"""
-    cutoff = target - pd.Timedelta(minutes=max(1, int(interval_minutes)))
-    start = target - pd.Timedelta(minutes=lookback_minutes)
-    part = data[(data.index <= cutoff) & (data.index >= start)]
-    if part.empty:
-        return None, None
-    return float(part["Close"].iloc[-1]), part.index[-1]
 
 
 def morning_score(change):
@@ -468,19 +486,13 @@ def _fx_label(usd_jpy):
 
 
 def _average_market_score(changes):
-    """取得できた指標だけを使って、-2〜+2の平均スコアを返す。"""
-    scores = [
-        morning_score(value)
-        for value in changes
-        if value is not None and not pd.isna(value)
-    ]
+    scores = [morning_score(value) for value in changes if value is not None and not pd.isna(value)]
     if not scores:
         return None
     return sum(scores) / len(scores)
 
 
 def _weighted_market_score(weighted_changes):
-    """取得できた指標だけで重みを正規化し、-2〜+2のスコアを返す。"""
     total = 0.0
     weight_sum = 0.0
     for value, weight in weighted_changes:
@@ -507,79 +519,37 @@ def _market_label_from_average(score):
     return "中立"
 
 
-def _build_morning_brief(daily, futures_pack):
-    """アプリを開いた時点で取得できる最新データから朝の地合いを作る。"""
-    nikkei = daily.get("nikkei")
-    topix = daily.get("topix")
-    nasdaq = daily.get("nasdaq")
-    sox = daily.get("sox")
-    kospi = daily.get("kospi")
-    usd_jpy = daily.get("usd_jpy")
-
-    futures_change = None
-    futures_price = None
-    base_price = None
-    base_time = None
-    target_time_used = None
-    session_date = None
-    interval = None
-    status = "先物データ取得不可"
-
-    if futures_pack is not None:
-        data = futures_pack["data"]
-        interval = futures_pack["interval"]
-        minutes = futures_pack["minutes"]
-
-        if not data.empty:
-            target_time_used = data.index[-1]
-            session_day = target_time_used.normalize()
-            session_date = session_day.strftime("%Y-%m-%d")
-            base_target = session_day + pd.Timedelta(hours=6)
-
-            base_price, base_time = _last_completed_price(
-                data, base_target, minutes, lookback_minutes=180
-            )
-            futures_price = float(data["Close"].iloc[-1])
-
-            if base_price is not None and base_price != 0:
-                futures_change = (futures_price / base_price - 1) * 100
-                status = "取得済み"
-            else:
-                status = "6:00基準値を取得できません"
+def _build_morning_brief(markets):
+    """アプリを開いた時点で取得できる最新データから地合いを作る。"""
+    nikkei = markets.get("nikkei")
+    topix = markets.get("topix")
+    nasdaq = markets.get("nasdaq")
+    sox = markets.get("sox")
+    kospi = markets.get("kospi")
+    usd_jpy = markets.get("usd_jpy")
+    futures = markets.get("futures")
 
     def change_of(item):
         return item.get("change") if item else None
 
-    # 市場全体は、方向性の異なる主要市場を同じ比重で確認する。
-    # 為替は銘柄ごとに意味が変わるので、総合点には入れず別表示にする。
     overall_score = _average_market_score([
-        futures_change,
-        change_of(nikkei),
-        change_of(topix),
-        change_of(nasdaq),
-        change_of(kospi),
+        change_of(futures), change_of(nikkei), change_of(topix), change_of(nasdaq), change_of(kospi)
     ])
 
-    # 半導体は製作者向けに朝の展望へ常時表示。
-    # SOXを最重視し、NASDAQ・日経先物・KOSPIも補助的に見る。
     semiconductor_score = _weighted_market_score([
         (change_of(sox), 0.45),
         (change_of(nasdaq), 0.20),
-        (futures_change, 0.20),
+        (change_of(futures), 0.20),
         (change_of(kospi), 0.15),
     ])
+
+    latest_times = [item.get("time") for item in markets.values() if item and item.get("time") is not None]
+    latest_time = max(latest_times) if latest_times else None
 
     return {
         "overall": _market_label_from_average(overall_score),
         "semiconductor": _market_label_from_average(semiconductor_score),
-        "futures_change": futures_change,
-        "futures_price": futures_price,
-        "base_price": base_price,
-        "base_time": base_time,
-        "target_time_used": target_time_used,
-        "session_date": session_date,
-        "interval": interval,
-        "status": status,
+        "futures": futures,
         "nikkei": nikkei,
         "topix": topix,
         "nasdaq": nasdaq,
@@ -587,22 +557,23 @@ def _build_morning_brief(daily, futures_pack):
         "kospi": kospi,
         "usd_jpy": usd_jpy,
         "fx": _fx_label(usd_jpy),
+        "latest_time": latest_time,
     }
 
 
-@st.cache_data(ttl=180, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_morning_market_brief():
-    """固定時刻ではなく、アクセス時点で取得できる最新値を1回だけ作る。"""
-    daily = {
+    """市場が開いていれば最新のイントラデイ値、閉場中なら最後に取得できた値を使う。"""
+    markets = {
+        "futures": fetch_market_snapshot("NKD=F"),
         "nikkei": fetch_market_snapshot("^N225"),
-        "topix": fetch_market_snapshot("^TOPX"),
+        "topix": fetch_market_snapshot(["998405.T", "^TOPX"]),
         "nasdaq": fetch_market_snapshot("^IXIC"),
         "sox": fetch_market_snapshot("^SOX"),
         "kospi": fetch_market_snapshot("^KS11"),
         "usd_jpy": fetch_market_snapshot("JPY=X"),
     }
-    futures_pack = fetch_nikkei_futures_intraday()
-    return _build_morning_brief(daily, futures_pack)
+    return _build_morning_brief(markets)
 
 
 def _fmt_pct(value):
@@ -611,12 +582,32 @@ def _fmt_pct(value):
     return f"{value:+.2f}%"
 
 
+def _fmt_price(value):
+    if value is None or pd.isna(value):
+        return "取得不可"
+    try:
+        number = float(value)
+        if abs(number) >= 1000:
+            return f"{number:,.0f}"
+        if abs(number) >= 100:
+            return f"{number:,.2f}"
+        return f"{number:,.3f}"
+    except Exception:
+        return "取得不可"
+
+
 def _fmt_market_line(label, item):
     if not item:
         return f"{label}　取得不可"
+    price = _fmt_price(item.get("close"))
     change = _fmt_pct(item.get("change"))
-    date_text = item.get("date") or "-"
-    return f"{label}　{change}　（{date_text}）"
+    time_value = item.get("time")
+    if time_value is not None:
+        time_text = time_value.strftime("%m/%d %H:%M")
+    else:
+        time_text = item.get("date") or "-"
+    interval = item.get("interval") or "-"
+    return f"{label}　{price}　{change}　（{time_text} / {interval}）"
 
 
 def show_morning_market_brief():
@@ -624,14 +615,14 @@ def show_morning_market_brief():
     st.markdown("### 🌅 朝の展望")
     brief = get_morning_market_brief()
 
-    target_time = brief.get("target_time_used")
-    if target_time is not None:
-        st.caption(f"最新取得時刻：{target_time.strftime('%Y-%m-%d %H:%M')} JST")
+    latest_time = brief.get("latest_time")
+    if latest_time is not None:
+        st.caption(f"最新取得データ：{latest_time.strftime('%Y-%m-%d %H:%M')} JST")
     else:
-        st.caption("最新取得時刻：先物データ取得不可")
+        st.caption("最新取得データ：各市場の最終取得値")
 
     st.markdown(f"**市場全体：{brief.get('overall', '判定保留')}**")
-    st.write(f"日経先物（6:00比）　{_fmt_pct(brief.get('futures_change'))}")
+    st.write(_fmt_market_line("日経先物", brief.get("futures")))
     st.write(_fmt_market_line("日経平均", brief.get("nikkei")))
     st.write(_fmt_market_line("TOPIX", brief.get("topix")))
     st.write(_fmt_market_line("NASDAQ", brief.get("nasdaq")))
@@ -639,33 +630,15 @@ def show_morning_market_brief():
 
     usd_jpy = brief.get("usd_jpy")
     if usd_jpy:
-        usd_price = usd_jpy.get("close")
-        usd_price_text = f"{usd_price:.2f}" if usd_price is not None else "取得不可"
-        st.write(
-            f"USD/JPY　{usd_price_text}　{_fmt_pct(usd_jpy.get('change'))}　"
-            f"（{brief.get('fx', '取得不可')}）"
-        )
+        st.write(f"{_fmt_market_line('USD/JPY', usd_jpy)}　（{brief.get('fx', '取得不可')}）")
     else:
         st.write("USD/JPY　取得不可")
 
     st.markdown(f"**半導体地合い：{brief.get('semiconductor', '判定保留')}**")
     st.write(_fmt_market_line("SOX", brief.get("sox")))
     st.caption("半導体地合いはSOXを最重視し、NASDAQ・日経先物・KOSPIも加味します。")
-
-    status = brief.get("status") or "-"
-    base_time = brief.get("base_time")
-    interval = brief.get("interval") or "-"
-    if base_time is not None and target_time is not None:
-        st.caption(
-            f"日経先物：基準 {base_time.strftime('%H:%M')} → "
-            f"最新 {target_time.strftime('%H:%M')}（{interval}足）｜{status}"
-        )
-    elif status != "取得済み":
-        st.caption(f"日経先物：{status}")
-
-    st.caption(
-        "個別銘柄分析では、その銘柄に関連するセクター・テーマ別の地合いも確認できるよう対応予定です。"
-    )
+    st.caption("各指標は、アプリを開いた時点で取得できる最新値を優先します。市場が閉まっている場合は、その市場で最後に取得できた値を表示します。")
+    st.caption("個別銘柄分析では、その銘柄に関連するセクター・テーマ別の地合いも確認できるよう対応予定です。")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2763,8 +2736,66 @@ def show_stock_outlook(result):
         st.text(result["detail"])
 
 
-def show_daytrade(result):
+def show_daytrade(result, stock_outlook=None):
     st.subheader("☀️ 今日のデイトレ展望")
+
+    # 「今日の株価展望」で使っていた情報は削除せず、
+    # デイトレ展望の中へ整理統合して表示する。
+    if stock_outlook:
+        if stock_outlook.get("error"):
+            st.warning(stock_outlook["error"])
+            if stock_outlook.get("detail"):
+                with st.expander("展望データのエラー詳細"):
+                    st.code(stock_outlook["detail"])
+        else:
+            st.markdown("**全体の方向性**")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("方向性", stock_outlook.get("direction", "-"))
+            with c2:
+                st.metric("値動き", stock_outlook.get("volatility", "-"))
+            with c3:
+                st.metric("信頼度", stock_outlook.get("confidence", "-"))
+
+            zones = stock_outlook.get("zones") or {}
+            up = zones.get("up") or {}
+            down = zones.get("down") or {}
+            up_prices = [
+                compact_outlook_price(up.get(key, "-"))
+                for key in ("first", "middle", "main", "major")
+                if up.get(key, "-") != "-"
+            ]
+            down_prices = [
+                compact_outlook_price(down.get(key, "-"))
+                for key in ("first", "middle", "main", "major")
+                if down.get(key, "-") != "-"
+            ]
+
+            st.markdown("**重要価格**")
+            st.write(
+                f'↑ 上方向　{" → ".join(up_prices) if up_prices else "取得できませんでした"}'
+            )
+            st.write(
+                f'↓ 下方向　{" → ".join(down_prices) if down_prices else "取得できませんでした"}'
+            )
+
+            market = stock_outlook.get("market") or {}
+            st.markdown("**個別銘柄の地合い**")
+            st.write(f'総合：{market.get("total", "-")}')
+            with st.expander("地合いの内訳"):
+                st.write(f'日本株：{market.get("japan", "-")}')
+                st.write(f'米国ハイテク：{market.get("us_tech", "-")}')
+                st.write(f'半導体：{market.get("semiconductor", "-")}')
+                st.write(f'アジア：{market.get("asia", "-")}')
+                st.write(f'為替：{market.get("fx", "-")}')
+
+            if stock_outlook.get("warning"):
+                st.caption(stock_outlook["warning"])
+
+            with st.expander("類似局面・展望の詳しい分析を見る"):
+                st.text(stock_outlook.get("detail", "詳細データはありません。"))
+
+            st.divider()
 
     c1, c2 = st.columns(2)
     with c1:
@@ -2814,8 +2845,8 @@ def show_daytrade(result):
         for comment in result["comments"]:
             st.write(f"・{comment}")
 
-    st.info(
-        "上の「今日の株価展望」で、重要価格・類似局面・地合いを確認できます。"
+    st.caption(
+        "重要価格・類似局面・地合いは、この「今日のデイトレ展望」に統合して表示しています。"
     )
 
 
@@ -3198,13 +3229,11 @@ if mode == "気になる銘柄を調べる":
         st.header(f"{code} {company}")
         st.caption(f"データ日：{data_date}")
 
-        if "outlook" in result:
-            show_stock_outlook(result["outlook"])
-
         if "daytrade" in result:
-            if "outlook" in result:
-                st.divider()
-            show_daytrade(result["daytrade"])
+            show_daytrade(
+                result["daytrade"],
+                result.get("outlook"),
+            )
 
         if "swing" in result:
             st.divider()
