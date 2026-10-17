@@ -2511,16 +2511,33 @@ def fetch_earnings_summary(code):
                 continue
 
             if item_year == latest_year - 1 and item_quarter == latest_quarter:
+                year_ago_revenue = item.get("revenue")
+                year_ago_operating_income = item.get("operating_income")
+                year_ago_forecast_revenue = item.get("forecast_revenue")
+                year_ago_forecast_operating_income = item.get("forecast_operating_income")
+
                 year_ago = {
                     "fiscal_year_end": item.get("fiscal_year_end"),
                     "quarter": item.get("quarter"),
                     "disclosure_date": format_disclosure_date(
                         item.get("disclosure_date")
                     ),
-                    "revenue": item.get("revenue"),
-                    "operating_income": item.get("operating_income"),
+                    "revenue": year_ago_revenue,
+                    "operating_income": year_ago_operating_income,
                     "ordinary_income": item.get("ordinary_income"),
                     "net_income": item.get("net_income"),
+                    # 同じ四半期時点の会社予想も保持し、季節性を考慮した
+                    # 「前年同期の進捗率」と比較できるようにする。
+                    "forecast_revenue": year_ago_forecast_revenue,
+                    "forecast_operating_income": year_ago_forecast_operating_income,
+                    "revenue_progress": calc_progress_rate(
+                        year_ago_revenue,
+                        year_ago_forecast_revenue,
+                    ),
+                    "operating_progress": calc_progress_rate(
+                        year_ago_operating_income,
+                        year_ago_forecast_operating_income,
+                    ),
                 }
                 break
     except Exception:
@@ -2576,6 +2593,7 @@ def calculate_earnings_adjustment(earnings, price_date=None):
             "forecast": 0,
             "actual": 0,
             "margin": 0,
+            "progress": 0,
             "freshness_rate": 1.0,
             "days_since_disclosure": None,
             "reasons": ["決算データを取得できないため補正なし"],
@@ -2690,9 +2708,71 @@ def calculate_earnings_adjustment(earnings, price_date=None):
         else:
             reasons.append("予想営業利益率の比較材料不足：0点")
 
+    # 4. 前年同四半期と比べた進捗（+2 ～ -2）
+    # 単純な25%/50%/75%基準ではなく、同じ会社の前年同四半期と比較することで
+    # 季節性や利益計上時期の偏りをある程度吸収する。
+    progress_score = 0
+    quarter_text = str(earnings.get("quarter") or "").upper().replace("Q", "")
+
+    if quarter_text == "4":
+        reasons.append("通期決算のため前年同期進捗の比較は採点外：0点")
+    elif year_ago:
+        current_op_progress = number(earnings.get("operating_progress"))
+        previous_op_progress = number(year_ago.get("operating_progress"))
+        current_rev_progress = number(earnings.get("revenue_progress"))
+        previous_rev_progress = number(year_ago.get("revenue_progress"))
+
+        # 営業利益の進捗を優先。比較不能な場合のみ売上高を補助に使う。
+        if current_op_progress is not None and previous_op_progress is not None:
+            progress_gap = current_op_progress - previous_op_progress
+            if progress_gap >= 10:
+                progress_score = 2
+                reasons.append(
+                    f"営業利益の進捗が前年同期を{progress_gap:+.1f}ポイント上回る：+2点"
+                )
+            elif progress_gap >= 5:
+                progress_score = 1
+                reasons.append(
+                    f"営業利益の進捗が前年同期を{progress_gap:+.1f}ポイント上回る：+1点"
+                )
+            elif progress_gap <= -10:
+                progress_score = -2
+                reasons.append(
+                    f"営業利益の進捗が前年同期を{progress_gap:+.1f}ポイント下回る：-2点"
+                )
+            elif progress_gap <= -5:
+                progress_score = -1
+                reasons.append(
+                    f"営業利益の進捗が前年同期を{progress_gap:+.1f}ポイント下回る：-1点"
+                )
+            else:
+                reasons.append(
+                    f"営業利益の進捗は前年同期比{progress_gap:+.1f}ポイントで大差なし：0点"
+                )
+        elif current_rev_progress is not None and previous_rev_progress is not None:
+            progress_gap = current_rev_progress - previous_rev_progress
+            if progress_gap >= 10:
+                progress_score = 1
+                reasons.append(
+                    f"売上高の進捗が前年同期を{progress_gap:+.1f}ポイント上回る：+1点"
+                )
+            elif progress_gap <= -10:
+                progress_score = -1
+                reasons.append(
+                    f"売上高の進捗が前年同期を{progress_gap:+.1f}ポイント下回る：-1点"
+                )
+            else:
+                reasons.append(
+                    f"売上高の進捗は前年同期比{progress_gap:+.1f}ポイントで大差なし：0点"
+                )
+        else:
+            reasons.append("前年同期の進捗比較材料不足：0点")
+    else:
+        reasons.append("前年同期の進捗比較材料不足：0点")
+
     raw_total = max(
         -12,
-        min(12, forecast_score + actual_score + margin_score),
+        min(12, forecast_score + actual_score + margin_score + progress_score),
     )
 
     # 決算開示から時間が経つほど、スイング判断への影響を弱める。
@@ -2735,6 +2815,7 @@ def calculate_earnings_adjustment(earnings, price_date=None):
         "forecast": forecast_score,
         "actual": actual_score,
         "margin": margin_score,
+        "progress": progress_score,
         "freshness_rate": freshness_rate,
         "days_since_disclosure": days_since_disclosure,
         "reasons": reasons,
@@ -2814,6 +2895,30 @@ def show_earnings_summary(earnings, price_date=None, show_swing_effect=True):
         st.write("営業利益：算出不可")
     else:
         st.write(f"営業利益：{operating_progress:.1f}%")
+
+    # 単純進捗率だけでは季節性を誤判定しやすいため、
+    # 同じ四半期の前年進捗と並べて確認する。
+    year_ago = earnings.get("year_ago")
+    if year_ago:
+        prior_rev_progress = year_ago.get("revenue_progress")
+        prior_op_progress = year_ago.get("operating_progress")
+        if any(value is not None for value in (prior_rev_progress, prior_op_progress)):
+            st.markdown("**前年同期と比べた進捗**")
+            if revenue_progress is not None and prior_rev_progress is not None:
+                st.write(
+                    f"売上高：前年 {prior_rev_progress:.1f}% → 今期 {revenue_progress:.1f}%"
+                    f"（{revenue_progress - prior_rev_progress:+.1f}ポイント）"
+                )
+            else:
+                st.write("売上高：比較不可")
+            if operating_progress is not None and prior_op_progress is not None:
+                st.write(
+                    f"営業利益：前年 {prior_op_progress:.1f}% → 今期 {operating_progress:.1f}%"
+                    f"（{operating_progress - prior_op_progress:+.1f}ポイント）"
+                )
+            else:
+                st.write("営業利益：比較不可")
+            st.caption("同じ四半期同士で比較し、会社ごとの季節性をできるだけ考慮します。")
 
     # 前年同四半期との実額比較
     st.markdown("**前年同四半期との比較**")
@@ -3160,8 +3265,9 @@ def show_earnings_summary(earnings, price_date=None, show_swing_effect=True):
             )
 
     st.caption(
-        "決算評価は、前年同四半期の実績と前回開示時の会社予想との実額比較による簡易判定です。"
-        "四半期ごとの季節性、特殊要因、会社固有の利益計上時期はまだ加味していません。"
+        "決算評価は、前年同四半期の実績・会社予想の修正・予想利益率に加え、"
+        "同じ四半期の前年進捗との比較を使う簡易判定です。"
+        "前年同期比較で季節性を一部考慮しますが、特殊要因や会社固有の利益計上時期を完全には補正できません。"
         "総合スイング適性には、業績補正として最大±12点を反映します。"
     )
 
@@ -3591,7 +3697,8 @@ def show_swing(result, earnings=None):
         st.write(
             f'元の内訳：会社予想 {adjustment["forecast"]:+d}点　｜　'
             f'前年同期実績 {adjustment["actual"]:+d}点　｜　'
-            f'予想利益率 {adjustment["margin"]:+d}点'
+            f'予想利益率 {adjustment["margin"]:+d}点　｜　'
+            f'前年同期進捗 {adjustment["progress"]:+d}点'
         )
         days = adjustment["days_since_disclosure"]
         freshness_pct = adjustment["freshness_rate"] * 100
