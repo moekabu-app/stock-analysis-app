@@ -562,18 +562,6 @@ def _fetch_topix_web_fallback():
     except Exception:
         pass
 
-    # 4) 最終手段。TOPIXそのものが取れない時だけ1306 ETFを参考値として使う。
-    #    画面上ではTOPIX実値と誤認しないよう proxy フラグを付ける。
-    try:
-        proxy = fetch_market_snapshot("1306.T")
-        if proxy is not None:
-            proxy = dict(proxy)
-            proxy["proxy"] = True
-            proxy["source"] = "1306.T"
-            return proxy
-    except Exception:
-        pass
-
     return None
 
 
@@ -651,12 +639,41 @@ def fetch_market_snapshot(symbol):
     return None
 
 
+def _valid_market_item(item):
+    """表示に使える前日比が入っているか確認する。"""
+    if not item:
+        return False
+    change = item.get("change")
+    try:
+        return change is not None and np.isfinite(float(change))
+    except Exception:
+        return False
+
+
 def fetch_topix_snapshot():
-    # yfinanceはTOPIXを返さないことがあるため、Web値へフォールバックする。
-    item = fetch_market_snapshot(["998405.T", "^TOPX"])
-    if item is not None:
+    """
+    TOPIXはYahoo/yfinanceで取りにくいことがあるため、
+    取得経路を分けて、前日比が実際に取れたものだけ採用する。
+    """
+    item = _fetch_topix_web_fallback()
+    if _valid_market_item(item):
         return item
-    return _fetch_topix_web_fallback()
+
+    item = fetch_market_snapshot(["998405.T", "^TOPX"])
+    if _valid_market_item(item):
+        return item
+
+    try:
+        proxy = fetch_stock_snapshot("1306")
+        if _valid_market_item(proxy):
+            proxy = dict(proxy)
+            proxy["proxy"] = True
+            proxy["source"] = "1306.T"
+            return proxy
+    except Exception:
+        pass
+
+    return None
 
 
 
