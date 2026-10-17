@@ -2791,13 +2791,14 @@ def calculate_earnings_adjustment(earnings, price_date=None):
         elif days_since_disclosure <= 14:
             freshness_rate = 1.0
         elif days_since_disclosure <= 30:
-            freshness_rate = 0.8
+            freshness_rate = 0.9
         elif days_since_disclosure <= 60:
-            freshness_rate = 0.6
-        elif days_since_disclosure <= 90:
-            freshness_rate = 0.4
+            freshness_rate = 0.75
         else:
-            freshness_rate = 0.2
+            # これが取得できる最新の公式決算である限り、
+            # 時間経過だけで影響を消しすぎない。
+            # 次の決算が出るまでは最低60%を残す。
+            freshness_rate = 0.6
     except Exception:
         # 日付を比較できない場合は、従来どおり元の補正を使用する。
         freshness_rate = 1.0
