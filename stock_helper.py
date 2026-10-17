@@ -5,6 +5,7 @@ import numpy as np
 import os
 import requests
 import hmac
+import html
 import re
 import subprocess
 import sys
@@ -384,6 +385,61 @@ def _timestamp_to_jst(value):
         return None
 
 
+def _daily_market_asof(symbol, value):
+    """日足しか取れない場合でも、各市場の終値時刻をJSTで持たせる。"""
+    try:
+        d = pd.Timestamp(value).date()
+        if symbol in ("^IXIC", "^SOX"):
+            local = pd.Timestamp(f"{d} 16:00", tz="America/New_York")
+            return local.tz_convert(ZoneInfo("Asia/Tokyo"))
+        if symbol == "^KS11":
+            local = pd.Timestamp(f"{d} 15:30", tz="Asia/Seoul")
+            return local.tz_convert(ZoneInfo("Asia/Tokyo"))
+        if symbol in ("^N225", "998405.T", "^TOPX"):
+            return pd.Timestamp(f"{d} 15:30", tz=ZoneInfo("Asia/Tokyo"))
+        if symbol == "JPY=X":
+            local = pd.Timestamp(f"{d} 17:00", tz="America/New_York")
+            return local.tz_convert(ZoneInfo("Asia/Tokyo"))
+        return _timestamp_to_jst(value)
+    except Exception:
+        return _timestamp_to_jst(value)
+
+
+def _fetch_topix_web_fallback():
+    """yfinanceでTOPIXが取れない時だけYahoo!ファイナンス日本版を参照する。"""
+    try:
+        response = requests.get(
+            "https://finance.yahoo.co.jp/quote/998405.T",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        plain = html.unescape(re.sub(r"<[^>]+>", " ", response.text))
+        plain = re.sub(r"\s+", " ", plain)
+        match = re.search(
+            r"前日比\s*([+\-−]?\d[\d,]*(?:\.\d+)?)\s*\(\s*([+\-−]?\d+(?:\.\d+)?)%\s*\)",
+            plain,
+        )
+        if not match:
+            return None
+        change = float(match.group(2).replace("−", "-"))
+        now_jst = pd.Timestamp.now(tz=ZoneInfo("Asia/Tokyo"))
+        # 休場中も直近営業日のTOPIX前日比として利用する。
+        return {
+            "close": None,
+            "previous": None,
+            "change": change,
+            "date": now_jst.strftime("%Y-%m-%d"),
+            "time": None,
+            "asof": None,
+            "interval": "web",
+            "symbol": "998405.T",
+            "live": True,
+        }
+    except Exception:
+        return None
+
+
 def fetch_market_snapshot(symbol):
     """
     朝の地合い用。
@@ -433,6 +489,7 @@ def fetch_market_snapshot(symbol):
                     "change": (latest / previous - 1) * 100 if previous else None,
                     "date": str(intraday_date) if intraday_date else str(latest_raw_time)[:10],
                     "time": _timestamp_to_jst(latest_raw_time),
+                    "asof": _timestamp_to_jst(latest_raw_time),
                     "interval": used_interval,
                     "symbol": active_symbol,
                     "live": True,
@@ -447,6 +504,7 @@ def fetch_market_snapshot(symbol):
                 "change": (latest / previous - 1) * 100 if previous else None,
                 "date": str(daily_time)[:10],
                 "time": None,
+                "asof": _daily_market_asof(active_symbol, daily_time),
                 "interval": "1d",
                 "symbol": active_symbol,
                 "live": False,
@@ -454,6 +512,14 @@ def fetch_market_snapshot(symbol):
         except Exception:
             continue
     return None
+
+
+def fetch_topix_snapshot():
+    # yfinanceはTOPIXを返さないことがあるため、Web値へフォールバックする。
+    item = fetch_market_snapshot(["998405.T", "^TOPX"])
+    if item is not None:
+        return item
+    return _fetch_topix_web_fallback()
 
 
 def morning_score(change):
@@ -527,6 +593,67 @@ def _market_label_from_average(score):
     return "中立"
 
 
+def _recency_factor(item, newest_asof):
+    """新しい市場データほど地合い判定への影響を強くする。"""
+    if not item or newest_asof is None:
+        return 0.35
+    asof = item.get("asof") or item.get("time")
+    if asof is None:
+        return 0.35
+    try:
+        age = max(0.0, (newest_asof - pd.Timestamp(asof)).total_seconds() / 3600.0)
+    except Exception:
+        return 0.35
+    if age <= 3:
+        return 1.0
+    if age <= 8:
+        return 0.80
+    if age <= 16:
+        return 0.50
+    if age <= 24:
+        return 0.30
+    return 0.15
+
+
+def _current_overall_score(markets):
+    """市場が閉まっていても、より新しい市場情報を重視して現在の地合いを判定する。"""
+    base_weights = {
+        "futures": 0.30,
+        "nasdaq": 0.25,
+        "nikkei": 0.15,
+        "topix": 0.15,
+        "kospi": 0.15,
+    }
+    asofs = []
+    for key in base_weights:
+        item = markets.get(key)
+        if not item:
+            continue
+        asof = item.get("asof") or item.get("time")
+        if asof is not None:
+            try:
+                asofs.append(pd.Timestamp(asof))
+            except Exception:
+                pass
+    newest = max(asofs) if asofs else None
+
+    total = 0.0
+    weight_sum = 0.0
+    for key, base_weight in base_weights.items():
+        item = markets.get(key)
+        if not item:
+            continue
+        change = item.get("change")
+        if change is None or pd.isna(change):
+            continue
+        weight = base_weight * _recency_factor(item, newest)
+        total += morning_score(change) * weight
+        weight_sum += weight
+    if weight_sum == 0:
+        return None
+    return total / weight_sum
+
+
 def _build_morning_brief(markets):
     """アプリを開いた時点で取得できる最新データから地合いを作る。"""
     nikkei = markets.get("nikkei")
@@ -540,9 +667,9 @@ def _build_morning_brief(markets):
     def change_of(item):
         return item.get("change") if item else None
 
-    overall_score = _average_market_score([
-        change_of(futures), change_of(nikkei), change_of(topix), change_of(nasdaq), change_of(kospi)
-    ])
+    # 単純平均では、古い日本市場の終値が新しい米国・先物の動きを
+    # 打ち消してしまうため、データの鮮度を加味して判定する。
+    overall_score = _current_overall_score(markets)
 
     semiconductor_score = _weighted_market_score([
         (change_of(sox), 0.45),
@@ -551,7 +678,11 @@ def _build_morning_brief(markets):
         (change_of(kospi), 0.15),
     ])
 
-    latest_times = [item.get("time") for item in markets.values() if item and item.get("time") is not None]
+    latest_times = [
+        (item.get("asof") or item.get("time"))
+        for item in markets.values()
+        if item and (item.get("asof") is not None or item.get("time") is not None)
+    ]
     latest_time = max(latest_times) if latest_times else None
 
     return {
@@ -575,7 +706,7 @@ def get_morning_market_brief():
     markets = {
         "futures": fetch_market_snapshot("NKD=F"),
         "nikkei": fetch_market_snapshot("^N225"),
-        "topix": fetch_market_snapshot(["998405.T", "^TOPX"]),
+        "topix": fetch_topix_snapshot(),
         "nasdaq": fetch_market_snapshot("^IXIC"),
         "sox": fetch_market_snapshot("^SOX"),
         "kospi": fetch_market_snapshot("^KS11"),
@@ -2782,14 +2913,18 @@ def show_daytrade(result, stock_outlook=None):
             )
 
             market = stock_outlook.get("market") or {}
+            # 地合いは朝の展望と同じ最新スナップショットを優先する。
+            latest_brief = get_morning_market_brief()
             st.markdown("**個別銘柄の地合い**")
-            st.write(f'総合：{market.get("total", "-")}')
+            st.write(f'総合：{latest_brief.get("overall", market.get("total", "-"))}')
             with st.expander("地合いの内訳"):
-                st.write(f'日本株：{market.get("japan", "-")}')
-                st.write(f'米国ハイテク：{market.get("us_tech", "-")}')
-                st.write(f'半導体：{market.get("semiconductor", "-")}')
-                st.write(f'アジア：{market.get("asia", "-")}')
-                st.write(f'為替：{market.get("fx", "-")}')
+                st.write(_fmt_market_line("日経先物", latest_brief.get("futures")))
+                st.write(_fmt_market_line("日経平均", latest_brief.get("nikkei")))
+                st.write(_fmt_market_line("TOPIX", latest_brief.get("topix")))
+                st.write(_fmt_market_line("NASDAQ", latest_brief.get("nasdaq")))
+                st.write(_fmt_market_line("SOX", latest_brief.get("sox")))
+                st.write(_fmt_market_line("KOSPI", latest_brief.get("kospi")))
+                st.write(_fmt_market_line("USD/JPY", latest_brief.get("usd_jpy")))
 
             if stock_outlook.get("warning"):
                 st.caption(stock_outlook["warning"])

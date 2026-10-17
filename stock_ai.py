@@ -2048,162 +2048,163 @@ if usd_jpy is not None:
 # =========================================================
 # 保存
 # =========================================================
-stock_file = f"{code}_株価データ.xlsx"
-similar_file = f"{code}_類似局面.xlsx"
-zone_file = f"{code}_分岐ライン候補.xlsx"
-ai_file = f"{code}_AI学習データ.csv"
-ground_file = f"{code}_地合いデータ.csv"
+if os.environ.get("STOCK_AI_SKIP_EXPORT", "0") != "1":
+    stock_file = f"{code}_株価データ.xlsx"
+    similar_file = f"{code}_類似局面.xlsx"
+    zone_file = f"{code}_分岐ライン候補.xlsx"
+    ai_file = f"{code}_AI学習データ.csv"
+    ground_file = f"{code}_地合いデータ.csv"
 
 
-data.to_excel(
-    stock_file
-)
-
-
-similar_save = similar.copy()
-
-similar_save.insert(
-    0,
-    "日付",
-    similar_save.index.strftime(
-        "%Y-%m-%d"
+    data.to_excel(
+        stock_file
     )
-)
-
-similar_save.to_excel(
-    similar_file,
-    index=False
-)
 
 
-zone_rows = []
+    similar_save = similar.copy()
 
-for direction, zones in [
-    ("上", up_zones),
-    ("下", down_zones)
-]:
+    similar_save.insert(
+        0,
+        "日付",
+        similar_save.index.strftime(
+            "%Y-%m-%d"
+        )
+    )
 
-    for zone in zones:
+    similar_save.to_excel(
+        similar_file,
+        index=False
+    )
 
-        zone_rows.append({
-            "方向": direction,
-            "ゾーン中心": zone["center"],
-            "ゾーン下限": zone["min"],
-            "ゾーン上限": zone["max"],
-            "重要度点数": zone["score"],
-            "重要度": zone_importance(
-                zone
+
+    zone_rows = []
+
+    for direction, zones in [
+        ("上", up_zones),
+        ("下", down_zones)
+    ]:
+
+        for zone in zones:
+
+            zone_rows.append({
+                "方向": direction,
+                "ゾーン中心": zone["center"],
+                "ゾーン下限": zone["min"],
+                "ゾーン上限": zone["max"],
+                "重要度点数": zone["score"],
+                "重要度": zone_importance(
+                    zone
+                ),
+                "現在値からの距離": zone["distance"],
+                "ATR距離": zone["atr_distance"],
+                "根拠": zone_reason(
+                    zone
+                )
+            })
+
+
+    zone_df = pd.DataFrame(
+        zone_rows
+    )
+
+    zone_df.to_excel(
+        zone_file,
+        index=False
+    )
+
+
+    ai_columns = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+        "RSI",
+        "5日乖離率",
+        "25日乖離率",
+        "出来高倍率",
+        "ATR率",
+        "5日線変化率",
+        "25日線変化率",
+        "当日騰落率",
+        "翌日終値騰落率",
+        "翌日寄付後最大上昇率",
+        "翌日寄付後最大下落率",
+        "翌日GU_GD率"
+    ]
+
+    data[
+        ai_columns
+    ].to_csv(
+        ai_file,
+        encoding="utf-8-sig"
+    )
+
+
+    ground_rows = []
+
+
+    def append_market_row(item):
+
+        if item is None:
+            return
+
+        ground_rows.append({
+            "指標": item["name"],
+            "シンボル": item["symbol"],
+            "データ日": str(
+                item["date"]
             ),
-            "現在値からの距離": zone["distance"],
-            "ATR距離": zone["atr_distance"],
-            "根拠": zone_reason(
-                zone
-            )
+            "終値": item["close"],
+            "前回値": item["previous"],
+            "騰落率": item["change"]
         })
 
 
-zone_df = pd.DataFrame(
-    zone_rows
-)
+    append_market_row(
+        nikkei
+    )
 
-zone_df.to_excel(
-    zone_file,
-    index=False
-)
+    append_market_row(
+        nasdaq
+    )
 
+    append_market_row(
+        sox
+    )
 
-ai_columns = [
-    "Open",
-    "High",
-    "Low",
-    "Close",
-    "Volume",
-    "RSI",
-    "5日乖離率",
-    "25日乖離率",
-    "出来高倍率",
-    "ATR率",
-    "5日線変化率",
-    "25日線変化率",
-    "当日騰落率",
-    "翌日終値騰落率",
-    "翌日寄付後最大上昇率",
-    "翌日寄付後最大下落率",
-    "翌日GU_GD率"
-]
+    append_market_row(
+        kospi
+    )
 
-data[
-    ai_columns
-].to_csv(
-    ai_file,
-    encoding="utf-8-sig"
-)
+    append_market_row(
+        usd_jpy
+    )
 
 
-ground_rows = []
+    if futures_price is not None:
+
+        ground_rows.append({
+            "指標": "日経先物(CME・6時比)",
+            "シンボル": "NKD=F",
+            "データ日": str(
+                nikkei_futures["date"]
+            ),
+            "終値": futures_price,
+            "前回値": futures_base_6 if futures_base_6 is not None else np.nan,
+            "騰落率": futures_gap
+        })
 
 
-def append_market_row(item):
+    ground_df = pd.DataFrame(
+        ground_rows
+    )
 
-    if item is None:
-        return
-
-    ground_rows.append({
-        "指標": item["name"],
-        "シンボル": item["symbol"],
-        "データ日": str(
-            item["date"]
-        ),
-        "終値": item["close"],
-        "前回値": item["previous"],
-        "騰落率": item["change"]
-    })
-
-
-append_market_row(
-    nikkei
-)
-
-append_market_row(
-    nasdaq
-)
-
-append_market_row(
-    sox
-)
-
-append_market_row(
-    kospi
-)
-
-append_market_row(
-    usd_jpy
-)
-
-
-if futures_price is not None:
-
-    ground_rows.append({
-        "指標": "日経先物(CME・6時比)",
-        "シンボル": "NKD=F",
-        "データ日": str(
-            nikkei_futures["date"]
-        ),
-        "終値": futures_price,
-        "前回値": futures_base_6 if futures_base_6 is not None else np.nan,
-        "騰落率": futures_gap
-    })
-
-
-ground_df = pd.DataFrame(
-    ground_rows
-)
-
-ground_df.to_csv(
-    ground_file,
-    index=False,
-    encoding="utf-8-sig"
-)
+    ground_df.to_csv(
+        ground_file,
+        index=False,
+        encoding="utf-8-sig"
+    )
 
 
 # =========================================================
